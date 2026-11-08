@@ -15,6 +15,7 @@
 import base64
 import datetime
 import re
+import time
 
 from . import pure_adb
 from .pure_adb import (AdbError, AdbTimeout, AdbUnauthorized,  # noqa: F401
@@ -51,21 +52,33 @@ class ActionError(Exception):
 
 # ---------------------------------------------------------------- соединение
 def _open(host: str, port: int = 5555, timeout: float = 8.0) -> AdbDevice:
-    """Подключается к adbd, ошибки оборачивает в ActionError с кодами i18n."""
+    """Подключается к adbd, ошибки оборачивает в ActionError с кодами i18n.
+
+    Одна повторная попытка, если TCP установился, но рукопожатие сорвалось:
+    ТВ-приставки часто держат «полуоткрытые» соединения после предыдущей
+    сессии и сбрасывают первый контакт. Если хост недоступен («connect: …»)
+    — повтор бессмыслен, падаем сразу.
+    """
     try:
         keypair = pure_adb.load_or_create_keys()
     except Exception as exc:  # noqa: BLE001
         raise ActionError(f"keygen: {exc}", "conn") from exc
-    device = AdbDevice(host, port, timeout=timeout, keypair=keypair)
-    try:
-        device.connect(auth_timeout=max(timeout, 30.0))
-    except AdbUnauthorized as exc:
-        device.close()
-        raise ActionError(str(exc), "unauthorized") from exc
-    except (AdbError, AdbTimeout, OSError) as exc:
-        device.close()
-        raise ActionError(str(exc), "conn") from exc
-    return device
+    last = None
+    for attempt in (1, 2):
+        device = AdbDevice(host, port, timeout=timeout, keypair=keypair)
+        try:
+            device.connect(auth_timeout=max(timeout, 30.0))
+            return device
+        except AdbUnauthorized as exc:
+            device.close()
+            raise ActionError(str(exc), "unauthorized") from exc
+        except (AdbError, AdbTimeout, OSError) as exc:
+            device.close()
+            last = exc
+            if str(exc).startswith("connect:") or attempt == 2:
+                break
+            time.sleep(0.4)
+    raise ActionError(str(last), "conn") from last
 
 
 def shell(host: str, command: str, port: int = 5555, timeout: float = 10.0) -> str:

@@ -10,6 +10,7 @@
 
 import datetime
 import os
+import re
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QImage, QPixmap
@@ -27,6 +28,10 @@ RISK_COLORS = {"low": "#43a047", "medium": "#fb8c00",
 
 APPS_COLUMNS = ("pkg", "version", "path")
 
+# Ошибки транспорта на уровне протокола: обычно это кривая/зависшая прошивка,
+# а не выключенный ADB — нужна другая подсказка, чем для "connect: ..."
+_PROTO_ERR_RE = re.compile(r"corrupted|closed by device|handshake|unexpected packet", re.I)
+
 
 def _friendly_error(exc: Exception, ip: str) -> str:
     """ActionError -> понятный локализованный текст."""
@@ -34,7 +39,8 @@ def _friendly_error(exc: Exception, ip: str) -> str:
         if exc.code == "unauthorized":
             return i18n.tr("adb_unauthorized")
         if exc.code == "conn":
-            return i18n.tr("adb_conn", ip=ip, port=5555, error=str(exc)[:150])
+            key = "adb_conn_protocol" if _PROTO_ERR_RE.search(str(exc)) else "adb_conn"
+            return i18n.tr(key, ip=ip, port=5555, error=str(exc)[:150])
     return str(exc)[:250]
 
 

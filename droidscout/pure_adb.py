@@ -33,6 +33,7 @@ from . import config
 A_VERSION = 0x01000001          # версия протокола (device возьмёт минимум)
 MAX_PAYLOAD = 256 * 1024        # предлагаемый размер чанка
 _CNXN_GRACE = 1.0               # окно ожидания AUTH после первого CNXN (сек)
+_MAX_RECV = 16 * 1024 * 1024    # санитарный предел длины пакета от устройства
 
 A_CNXN = 0x4E584E43             # "CNXN" — установка соединения
 A_AUTH = 0x41755448             # "AUTH"  — аутентификация RSA
@@ -321,6 +322,7 @@ class AdbDevice:
         self._local_id = 1
         self.keypair = keypair
         self.public_key_sent = False   # True → устройство ждало подтверждения
+        self.bad_checksums = 0         # пакеты с неверной суммой (кривые прошивки)
 
     # ------------------------------------------------------------- соединение
     def connect(self, auth_timeout: "float | None" = None):
@@ -340,6 +342,11 @@ class AdbDevice:
         except OSError as exc:
             raise AdbError(f"connect: {exc}") from exc
         self.sock.settimeout(self.timeout)
+        try:
+            # Nagle вносит задержки в пакетный обмен «запрос-ответ»
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass  # экзотическая платформа — работает и без этого
         self._send(A_CNXN, A_VERSION, MAX_PAYLOAD, b"host::\x00")
         deadline_ts = _now() + deadline
         pubkey_sent = False
@@ -561,11 +568,18 @@ class AdbDevice:
         self.sock.settimeout(timeout)
         header = _read_exact(self.sock, 24)
         cmd, arg0, arg1, length, crc, magic = struct.unpack("<IIIIII", header)
-        if cmd ^ 0xFFFFFFFF != magic:
+        if cmd ^ 0xFFFFFFFF != magic or length > _MAX_RECV:
+            # Рассинхронизация потока — дальше читать бессмысленно.
             raise AdbError("corrupted packet header")
         data = _read_exact(self.sock, length) if length else b""
         if data and checksum(data) != crc:
-            raise AdbError("corrupted packet payload")
+            # НЕ отбрасываем пакет. Официальный adb проверку суммы полученных
+            # пакетов тоже фактически игнорирует (check_data() в adb.cpp
+            # только логирует несовпадение). Часть прошивок — прежде всего
+            # ТВ-приставки с модифицированными сборками adbd — шлёт заведомо
+            # неверные суммы при корректных данных; раньше из-за этого
+            # соединение падало с «corrupted packet payload».
+            self.bad_checksums += 1
         return _Message(cmd, arg0, arg1, data)
 
 
