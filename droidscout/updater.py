@@ -28,7 +28,7 @@ from . import __version__, APP_NAME, config, i18n
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-DEFAULT_OWNER = "OWNER"
+DEFAULT_OWNER = "teliy"
 DEFAULT_REPO = "droidscout"
 UPDATE_EXCLUDE = {"venv", ".venv", ".git", "__pycache__", "backup", ".idea", ".vscode"}
 KEEP_FILES = {"settings.json", "history.db", "_repo.json"}

@@ -54,13 +54,13 @@ unset DS_OWNER DS_TOKEN
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/OWNER/droidscout/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/teliy/droidscout/main/install.ps1 | iex
 ```
 
 **Linux / macOS (bash):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/droidscout/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/teliy/droidscout/main/install.sh | bash
 ```
 
 > Замените плейсхолдер на ваш GitHub-логин (или запустите `scripts/publish_github.*` — он подставит логин сам).
@@ -90,7 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/OWNER/droidscout/main/install.sh | 
 ## Запуск без установки
 
 ```bash
-git clone https://github.com/OWNER/droidscout
+git clone https://github.com/teliy/droidscout
 cd droidscout
 python -m venv venv
 venv/bin/pip install -r requirements.txt    # Windows: venv\Scripts\pip
