@@ -1,0 +1,119 @@
+# DroidScout
+
+**Сканер локальной сети для поиска Android-устройств** — телефонов, планшетов, TV-приставок и медиаплееров. GUI-приложение на Python (PySide6/Qt) с тёмной и светлой темами, двуязычным интерфейсом (RU/EN), историей сканирований и самообновлением с GitHub.
+
+*A local network scanner that finds Android devices — phones, tablets, TV boxes and media players. Python GUI app (PySide6/Qt) with dark/light themes, RU/EN interface, scan history and self-update from GitHub.*
+
+---
+
+## Установка в одну строку / One-line install
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/OWNER/droidscout/main/install.ps1 | iex
+```
+
+**Linux / macOS (bash):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/OWNER/droidscout/main/install.sh | bash
+```
+
+> Замените `OWNER` на ваш GitHub-логин (или запустите `scripts/publish_github.sh` — он сделает это сам).
+
+Установщик **спросит каталог установки**, проверит Python 3.9+ (при отсутствии предложит установить), сам скачает репозиторий, **создаст venv**, поставит все зависимости и создаст ярлыки:
+
+- Windows: ярлык на рабочем столе + `DroidScout.cmd`;
+- Linux/macOS: команда `droidscout` в `~/.local/bin` + запись в меню приложений.
+
+## Что умеет
+
+- **Поиск всех живых хостов** в подсети (ICMP-опрос, до 65 000 адресов).
+- **Определение Android-устройств** с оценкой уверенности 0–100 % по совокупности признаков:
+  - открытый ADB по сети (порт 5555) и ADB TLS;
+  - mDNS-службы: Google Cast, Android TV Remote, AirPlay;
+  - SSDP/UPnP-описания (производитель, модель, MediaRenderer);
+  - HTTP-баннеры с упоминанием Android/embedded Linux;
+  - производитель по MAC-адресу из базы IEEE (40 000+ префиксов: Samsung, Xiaomi, Huawei, Google, TCL, Amlogic и др.);
+  - имена хостов вида `android-*`, модели Fire TV (`AFT*`).
+- **Полная карточка устройства**: IP, MAC, производитель, имя хоста, тип (телефон/планшет, Android TV/приставка, медиаплеер…), модель, открытые порты, службы, признаки.
+- **ADB-детали** (опционально): если установлен `adb` и устройство разрешает отладку по сети — модель, бренд, версия Android, SDK, серийный номер.
+- **История сканирований** (SQLite) и **подсветка новых устройств**, которых не было раньше.
+- **Экспорт отчёта** в CSV (Excel-совместимый) и JSON.
+- **Темы**: тёмная и светлая, переключение на лету. **Языки**: русский и английский, автоопределение по локали.
+- **Самообновление**: приложение проверяет GitHub Releases при запуске (отключается в настройках) и по кнопке, скачивает новую версию, устанавливает её поверх (venv и история не затрагиваются) и предлагает перезапуск.
+
+## Запуск без установки
+
+```bash
+git clone https://github.com/OWNER/droidscout
+cd droidscout
+python -m venv venv
+venv/bin/pip install -r requirements.txt    # Windows: venv\Scripts\pip
+venv/bin/python droidscout.py               # Windows: venv\Scripts\python droidscout.py
+```
+
+## Обновления
+
+- Кнопка **«Проверить обновления»** или автоматическая проверка при старте.
+- Пока репозиторий **приватный**, укажите в «Настройках» GitHub-токен ( fine-grained, право Contents: Read достаточно) — иначе API вернёт 404.
+- После публикации репозитория токен не нужен.
+
+## Как это работает
+
+| Этап | Метод | Что даёт |
+|---|---|---|
+| 1 | ICMP ping-опрос подсети | список живых хостов |
+| 2 | Чтение ARP-таблицы ОС | MAC-адреса и производители |
+| 3 | TCP-сканирование 25 портов | ADB, Cast, HTTP, SSH, UPnP и др. |
+| 4 | mDNS (zeroconf) | Google Cast, Android TV Remote, ADB TLS, AirPlay + модели |
+| 5 | SSDP/UPnP | производитель, модель, MediaRenderer |
+| 6 | HTTP GET | баннеры `Server:`, `<title>` |
+| 7 | Обратный DNS | имена хостов |
+| 8 | Эвристика | тип устройства и вердикт «Android» с уверенностью |
+
+Права администратора не требуются: используются только системные `ping`, ARP-таблица и обычные TCP-подключения.
+
+## Публикация приватного репозитория
+
+```bash
+# 1. Установите GitHub CLI и войдите: gh auth login
+# 2. Из корня проекта:
+./scripts/publish_github.sh ВАШ_ЛОГИН          # Linux/macOS
+powershell -File scripts\publish_github.ps1 -Login ВАШ_ЛОГИН   # Windows
+```
+
+Скрипт создаст приватный репозиторий `droidscout`, запушит код и подставит логин во все установщики.
+
+## Структура проекта
+
+```
+droidscout/
+├── droidscout.py            # лаунчер
+├── requirements.txt
+├── install.sh / install.ps1 # установщики (вопрос пути, venv, зависимости)
+├── scripts/                 # публикация приватного репо на GitHub
+└── droidscout/              # пакет приложения
+    ├── main.py              # точка входа
+    ├── scanner.py           # сетевой движок (ping, ARP, порты, mDNS, SSDP, HTTP)
+    ├── fingerprint.py       # классификация Android-устройств
+    ├── oui.py + data/       # база производителей MAC (IEEE, gzip)
+    ├── adb_info.py          # углублённый опрос через adb
+    ├── storage.py           # SQLite-история
+    ├── exporter.py          # CSV/JSON
+    ├── updater.py           # проверка и установка обновлений с GitHub
+    ├── config.py / i18n.py  # настройки и локализация RU/EN
+    └── ui/                  # PySide6: окно, темы, модель таблицы, диалоги
+```
+
+## Известные ограничения
+
+- Рандомизация MAC в современных телефонах может скрывать производителя — в этом случае Android определяется по службам (Cast/ADB/TLS).
+- ADB-опрос работает только если на устройстве включена «Отладка по USB» и пользователь разрешил подключение.
+- Windows SmartScreen может предупредить о запуске скачанного из интернета скрипта — это нормально для PowerShell-установщиков.
+- Для сканирования нескольких /24-подсетей используйте выбор «Все сети».
+
+## Лицензия
+
+MIT
