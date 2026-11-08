@@ -17,6 +17,8 @@ DEFAULTS: Dict[str, Any] = {
     "last_update_check": 0,      # unix ts
     "deep_scan": True,
     "scan_timeout_ms": 1500,
+    "adb_native": True,          # встроенный ADB-клиент (без platform-tools)
+    "adb_path": "",              # путь к внешнему adb; пусто -> автопоиск
 }
 
 _lock = threading.Lock()

@@ -16,7 +16,8 @@ from PySide6.QtWidgets import (
 from .. import __version__, APP_NAME, adb_info, config, exporter, i18n, scanner, storage
 from ..fingerprint import Device, type_label, verdict_label
 from .device_model import DeviceModel
-from .dialogs import SettingsDialog, UpdateDialog, UpdateWorker
+from .dialogs import (AdbInstallDialog, AdbQueryWorker, SettingsDialog,
+                      UpdateDialog, UpdateWorker)
 from .theme import apply_theme, app_icon, theme_bg
 
 
@@ -380,13 +381,20 @@ class MainWindow(QMainWindow):
         device = self.model.device_at(row)
         if not device:
             return
-        if not adb_info.adb_available():
-            QMessageBox.information(self, i18n.tr("adb_result"), i18n.tr("adb_not_found"))
-            return
+        # Опрос в фоне: без блокировки интерфейса (ключи/сеть/adb)
+        self.adb_btn.setEnabled(False)
+        self._adb_device = device
         self.status_label.setText(i18n.tr("adb_running", ip=device.ip))
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        props, error = adb_info.query_device(device.ip)
-        QApplication.restoreOverrideCursor()
+        self.adb_worker = AdbQueryWorker(device.ip, self)
+        self.adb_worker.result.connect(self._on_adb_result)
+        self.adb_worker.start()
+
+    def _on_adb_result(self, props, error):
+        self.adb_btn.setEnabled(True)
+        device = getattr(self, "_adb_device", None)
+        if not device:
+            return
+        source = (props or {}).pop("adb_source", "")
         if props:
             for key, value in props.items():
                 device.extras["adb_" + key] = value
@@ -394,16 +402,44 @@ class MainWindow(QMainWindow):
                 device.model = device.model or props["model"]
             if props.get("manufacturer"):
                 device.manufacturer = device.manufacturer or props["manufacturer"]
-            device.evidence.append("ADB getprop: Android " + props.get("android_version", "?"))
+            via = "built-in" if source == "native" else "adb"
+            device.evidence.append(f"ADB getprop ({via}): Android "
+                                   + props.get("android_version", "?"))
             from .. import fingerprint
             fingerprint.classify(device)
             self.model.add_device(device)
             self.details.setPlainText(self._details_text(device))
             self.status_label.setText(i18n.tr("adb_ok"))
+            return
+        # Ошибки: нет ни встроенного успеха, ни внешнего adb — предлагаем установку
+        if error == "adb_missing" or (error.startswith("conn:")
+                                      and not adb_info.adb_available()):
+            dialog = AdbInstallDialog(self)
+            dialog.exec()
+            if dialog.adb_path:
+                self._retry_adb(device)   # повторный опрос с новым adb
+            elif error == "adb_missing" and not adb_info.native_enabled():
+                QMessageBox.information(self, i18n.tr("adb_result"),
+                                        i18n.tr("adb_not_found"))
+            return
+        self.status_label.setText(i18n.tr("ready"))
+        if error == "unauthorized":
+            QMessageBox.information(self, i18n.tr("adb_result"),
+                                    i18n.tr("adb_unauthorized"))
         else:
-            self.status_label.setText(i18n.tr("ready"))
+            detail = error.split(":", 1)[1] if error.startswith("conn:") else error
             QMessageBox.warning(self, i18n.tr("adb_result"),
-                                i18n.tr("adb_fail", error=error[:200]))
+                                i18n.tr("adb_conn", ip=device.ip, port=5555,
+                                        error=detail[:200]))
+
+    def _retry_adb(self, device):
+        """Повторный опрос после установки Platform-Tools."""
+        self.adb_btn.setEnabled(False)
+        self._adb_device = device
+        self.status_label.setText(i18n.tr("adb_running", ip=device.ip))
+        self.adb_worker = AdbQueryWorker(device.ip, self)
+        self.adb_worker.result.connect(self._on_adb_result)
+        self.adb_worker.start()
 
     def copy_details(self):
         clipboard = QApplication.clipboard()
