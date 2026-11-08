@@ -8,6 +8,49 @@
 
 ## Установка в одну строку / One-line install
 
+> **Важно:** если репозиторий **приватный**, GitHub отдаёт файлы только по токену —
+> обычная ссылка `raw.githubusercontent.com` вернёт **404 Not Found**. Используйте вариант 1.
+> Для публичного репозитория подойдет короткий вариант 2.
+
+### Вариант 1 — приватный репозиторий (токен)
+
+**Шаг 1.** Опубликуйте репозиторий: [скрипт публикации](#публикация-приватного-репозитория).
+
+**Шаг 2.** Создайте fine-grained токен: <https://github.com/settings/personal-access-tokens/new>
+
+- *Repository access* → *Only select repositories* → `droidscout`;
+- *Permissions → Repository → Contents* → **Read-only** (Metadata подставится автоматически);
+- срок действия — на ваш выбор. Токен хранится только на вашем компьютере.
+
+**Шаг 3.** Скопируйте блок целиком и вставьте в консоль — он спросит логин и токен:
+
+**Windows (PowerShell):**
+
+```powershell
+& { $o = Read-Host "Логин GitHub"
+    $s = Read-Host "Токен GitHub" -AsSecureString
+    $env:DS_OWNER = $o
+    $env:DS_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
+    irm "https://raw.githubusercontent.com/$o/droidscout/main/install.ps1" | iex
+    Remove-Item Env:DS_TOKEN, Env:DS_OWNER -ErrorAction SilentlyContinue }
+```
+
+**Linux / macOS (bash):**
+
+```bash
+read -rp "Логин GitHub: " DS_OWNER; read -rsp "Токен GitHub (скрытно): " DS_TOKEN; echo; \
+export DS_OWNER DS_TOKEN; \
+curl -fsSL "https://raw.githubusercontent.com/$DS_OWNER/droidscout/main/install.sh" | bash; \
+unset DS_OWNER DS_TOKEN
+```
+
+Установщик спросит каталог установки, скачает репозиторий по токену, создаст venv,
+поставит зависимости и **сохранит токен в настройки приложения** — автообновления будут
+работать сразу. Сменить или удалить токен можно позже: приложение → Настройки → Репозиторий.
+
+### Вариант 2 — публичный репозиторий (без токена)
+
 **Windows (PowerShell):**
 
 ```powershell
@@ -20,7 +63,7 @@ irm https://raw.githubusercontent.com/OWNER/droidscout/main/install.ps1 | iex
 curl -fsSL https://raw.githubusercontent.com/OWNER/droidscout/main/install.sh | bash
 ```
 
-> Замените `OWNER` на ваш GitHub-логин (или запустите `scripts/publish_github.sh` — он сделает это сам).
+> Замените плейсхолдер на ваш GitHub-логин (или запустите `scripts/publish_github.*` — он подставит логин сам).
 
 Установщик **спросит каталог установки**, проверит Python 3.9+ (при отсутствии предложит установить), сам скачает репозиторий, **создаст venv**, поставит все зависимости и создаст ярлыки:
 
@@ -57,8 +100,8 @@ venv/bin/python droidscout.py               # Windows: venv\Scripts\python droid
 ## Обновления
 
 - Кнопка **«Проверить обновления»** или автоматическая проверка при старте.
-- Пока репозиторий **приватный**, укажите в «Настройках» GitHub-токен ( fine-grained, право Contents: Read достаточно) — иначе API вернёт 404.
-- После публикации репозитория токен не нужен.
+- Пока репозиторий **приватный**, приложению нужен GitHub-токен (fine-grained, право Contents: Read достаточно): установщик сохраняет его автоматически, либо укажите вручную в «Настройках» — иначе API вернёт 404.
+- Если репозиторий публичный, токен не нужен.
 
 ## Как это работает
 
@@ -84,7 +127,9 @@ venv/bin/python droidscout.py               # Windows: venv\Scripts\python droid
 powershell -File scripts\publish_github.ps1 -Login ВАШ_ЛОГИН   # Windows
 ```
 
-Скрипт создаст приватный репозиторий `droidscout`, запушит код и подставит логин во все установщики.
+Скрипт создаст приватный репозиторий `droidscout`, запушит код, подставит логин во все
+установщики, создаст релиз `v1.0.0` (чтобы автообновления сразу работали) и напечатает
+готовые команды установки и создания токена.
 
 ## Структура проекта
 

@@ -19,11 +19,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from typing import Callable, Dict, Optional
 
-from . import __version__, APP_NAME, config
+from . import __version__, APP_NAME, config, i18n
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -83,6 +84,23 @@ def is_newer(candidate: str, current: str = __version__) -> bool:
     return parse_version(candidate) > parse_version(current)
 
 
+def _friendly_http_error(exc: urllib.error.HTTPError) -> str:
+    """Читаемые сообщения для типовых кодов GitHub API.
+
+    В тексте обязательно остаётся числовой код (401/403/404) —
+    UI по нему добавляет подсказку о приватном репозитории.
+    """
+    mapping = {
+        401: "update_err_401",
+        403: "update_err_403",
+        404: "update_err_404",
+    }
+    key = mapping.get(exc.code)
+    if key:
+        return i18n.tr(key)
+    return str(exc)
+
+
 def fetch_latest_release() -> Optional[Dict[str, str]]:
     """Вернёт dict(tag, name, notes, zipball, html_url, published) или None.
 
@@ -91,6 +109,8 @@ def fetch_latest_release() -> Optional[Dict[str, str]]:
     try:
         with _request(_api_url("/releases/latest")) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(_friendly_http_error(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(str(exc)) from exc
     if "tag_name" not in data:
