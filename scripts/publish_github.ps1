@@ -66,10 +66,12 @@ Write-Host "================= Шаг 3: установка (скопируйте
 Write-Host ""
 Write-Host '  & { $o = Read-Host "Логин GitHub"'
 Write-Host '      $s = Read-Host "Токен GitHub" -AsSecureString'
-Write-Host '      $env:DS_OWNER = $o'
-Write-Host '      $env:DS_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringAuto('
-Write-Host '                          [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))'
-Write-Host '      irm "https://raw.githubusercontent.com/$o/droidscout/main/install.ps1" | iex }'
+Write-Host '      $t = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))'
+Write-Host '      $env:DS_OWNER = $o; $env:DS_TOKEN = $t'
+Write-Host '      $f = Join-Path $env:TEMP "droidscout-install.ps1"'
+Write-Host '      Invoke-WebRequest -UseBasicParsing -Headers @{ Authorization = "token $t" } -Uri "https://raw.githubusercontent.com/$o/droidscout/main/install.ps1" -OutFile $f'
+Write-Host '      & $f'
+Write-Host '      Remove-Item Env:DS_TOKEN, Env:DS_OWNER -ErrorAction SilentlyContinue; Remove-Item $f -ErrorAction SilentlyContinue }'
 Write-Host ""
 Write-Host "Токен установщик сохранит в настройки приложения — автообновления заработают сразу."
 Write-Host ""

@@ -2,10 +2,12 @@
 # ============================================================================
 #  DroidScout — установщик для Linux / macOS
 #
-#  Приватный репозиторий (команда спросит логин и токен):
+#  Приватный репозиторий (команда спросит логин и токен; ВАЖНО: заголовок
+#  Authorization обязателен — без него raw.githubusercontent вернёт 404):
 #    read -rp "Логин GitHub: " DS_OWNER; read -rsp "Токен GitHub: " DS_TOKEN; echo; \
 #      export DS_OWNER DS_TOKEN; \
-#      curl -fsSL "https://raw.githubusercontent.com/$DS_OWNER/droidscout/main/install.sh" | bash
+#      curl -fsSL -H "Authorization: token $DS_TOKEN" \
+#        "https://raw.githubusercontent.com/$DS_OWNER/droidscout/main/install.sh" | bash
 #
 #  Публичный репозиторий:
 #    curl -fsSL https://raw.githubusercontent.com/ВАШ_ЛОГИН/droidscout/main/install.sh | bash

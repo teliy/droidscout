@@ -29,11 +29,14 @@
 ```powershell
 & { $o = Read-Host "Логин GitHub"
     $s = Read-Host "Токен GitHub" -AsSecureString
+    $t = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
     $env:DS_OWNER = $o
-    $env:DS_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
-    irm "https://raw.githubusercontent.com/$o/droidscout/main/install.ps1" | iex
-    Remove-Item Env:DS_TOKEN, Env:DS_OWNER -ErrorAction SilentlyContinue }
+    $env:DS_TOKEN = $t
+    $f = Join-Path $env:TEMP "droidscout-install.ps1"
+    Invoke-WebRequest -UseBasicParsing -Headers @{ Authorization = "token $t" } -Uri "https://raw.githubusercontent.com/$o/droidscout/main/install.ps1" -OutFile $f
+    & $f
+    Remove-Item Env:DS_TOKEN, Env:DS_OWNER -ErrorAction SilentlyContinue
+    Remove-Item $f -ErrorAction SilentlyContinue }
 ```
 
 **Linux / macOS (bash):**
@@ -41,7 +44,7 @@
 ```bash
 read -rp "Логин GitHub: " DS_OWNER; read -rsp "Токен GitHub (скрытно): " DS_TOKEN; echo; \
 export DS_OWNER DS_TOKEN; \
-curl -fsSL "https://raw.githubusercontent.com/$DS_OWNER/droidscout/main/install.sh" | bash; \
+curl -fsSL -H "Authorization: token $DS_TOKEN" "https://raw.githubusercontent.com/$DS_OWNER/droidscout/main/install.sh" | bash; \
 unset DS_OWNER DS_TOKEN
 ```
 

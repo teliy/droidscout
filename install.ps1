@@ -1,13 +1,18 @@
 ﻿# ============================================================================
 #  DroidScout - установщик для Windows (PowerShell 5.1+)
 #
-#  Приватный репозиторий (команда спросит логин и токен):
+#  Приватный репозиторий (команда спросит логин и токен; ВАЖНО: заголовок
+#  Authorization обязателен - без него raw.githubusercontent вернёт 404):
 #    & { $o = Read-Host "Логин GitHub"
 #        $s = Read-Host "Токен GitHub" -AsSecureString
+#        $t = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
 #        $env:DS_OWNER = $o
-#        $env:DS_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-#                            [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
-#        irm "https://raw.githubusercontent.com/$o/droidscout/main/install.ps1" | iex }
+#        $env:DS_TOKEN = $t
+#        $f = Join-Path $env:TEMP "droidscout-install.ps1"
+#        Invoke-WebRequest -UseBasicParsing -Headers @{ Authorization = "token $t" } -Uri "https://raw.githubusercontent.com/$o/droidscout/main/install.ps1" -OutFile $f
+#        & $f
+#        Remove-Item Env:DS_TOKEN, Env:DS_OWNER -ErrorAction SilentlyContinue
+#        Remove-Item $f -ErrorAction SilentlyContinue }
 #
 #  Публичный репозиторий:
 #    irm https://raw.githubusercontent.com/ВАШ_ЛОГИН/droidscout/main/install.ps1 | iex
