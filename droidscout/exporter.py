@@ -20,6 +20,7 @@ def _rows(devices: List[Device]) -> List[dict]:
         "confidence": d.confidence,
         "ports": ";".join(str(p) for p in sorted(d.ports)),
         "services": ";".join(sorted(d.services)),
+        "ttl": d.ttl or "",
         "http_banner": d.http_banner,
         "upnp": d.ssdp_info,
         "is_new": d.is_new,

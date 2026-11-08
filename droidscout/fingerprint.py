@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
-from . import i18n, oui
+from . import i18n, netprobe, oui
 
 # Пороги уверенности (0..100)
 CONF_ANDROID = 60      # >= 60 — считается Android-устройством
@@ -26,6 +26,7 @@ class Device:
     services: Set[str] = field(default_factory=set)   # adb, cast, tvremote, upnp, http...
     http_banner: str = ""
     ssdp_info: str = ""             # friendlyName/manufacturer/model из UPnP XML
+    ttl: int = 0                    # TTL ping-ответа (признак ОС/класса устройства)
     evidence: List[str] = field(default_factory=list)
     extras: Dict[str, str] = field(default_factory=dict)
     seen_ts: float = field(default_factory=time.time)
@@ -40,6 +41,8 @@ class Device:
             theirs = getattr(other, src)
             if not mine and theirs:
                 setattr(self, dst, theirs)
+        if not self.ttl and other.ttl:
+            self.ttl = other.ttl
         self.ports |= other.ports
         self.services |= other.services
         for key, value in other.extras.items():
@@ -177,6 +180,10 @@ def classify(device: Device) -> Device:
         score += 50
         evidence.append("ADB getprop: Android " + device.extras["adb_version"])
 
+    # --- TTL ping-ответа: класс ОС/устройства ---
+    if device.ttl:
+        evidence.append(netprobe.ttl_evidence(device.ttl, "ru"))
+
     device.confidence = max(0, min(100, score))
 
     if device.confidence >= CONF_ANDROID:
@@ -208,6 +215,11 @@ def classify(device: Device) -> Device:
         device.device_type = "pc"
     elif 80 in device.ports or 443 in device.ports:
         device.device_type = "router"
+    elif device.ttl:
+        # нет других сигналов — грубая оценка по TTL
+        guess = netprobe.ttl_guess(device.ttl)
+        device.device_type = {"windows": "pc", "network": "router",
+                              "linux": "other"}.get(guess, "other")
     else:
         device.device_type = "unknown" if device.verdict == "unknown" else "other"
 
@@ -217,4 +229,8 @@ def classify(device: Device) -> Device:
     # Заполняем vendor по OUI, если пусто
     if not device.vendor and device.mac:
         device.vendor = oui.lookup_vendor(device.mac)[1]
+    # Локальные признаки classify переносим в устройство (раньше терялись)
+    for ev in evidence:
+        if ev not in device.evidence:
+            device.evidence.append(ev)
     return device

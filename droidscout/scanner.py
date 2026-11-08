@@ -21,7 +21,7 @@ import psutil
 
 from PySide6.QtCore import QThread, Signal
 
-from . import fingerprint, oui
+from . import fingerprint, netprobe, oui
 from .fingerprint import Device
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -34,6 +34,7 @@ SCAN_PORTS: Tuple[Tuple[int, str], ...] = (
     (8009, "cast"), (8080, "http"), (8081, "http"), (8443, "https"),
     (8554, "rtsp"), (9000, "http"), (9100, "ipp"), (36669, "http"),
     (49152, "upnp"), (49153, "upnp"), (49154, "upnp"),
+    (3389, "rdp"), (5900, "vnc"), (32400, "http"),
 )
 
 MDNS_TYPES: Tuple[str, ...] = (
@@ -83,7 +84,8 @@ def local_networks() -> List[Tuple[str, str]]:
 
 # ------------------------------------------------------------------- утилиты
 
-def _ping(ip: str, timeout_ms: int) -> bool:
+def _ping(ip: str, timeout_ms: int) -> Tuple[bool, int]:
+    """Один ICMP-запрос. Возвращает (жив, ttl из ответа; 0 — не разобрать)."""
     sysname = platform.system().lower()
     if sysname == "windows":
         cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
@@ -92,11 +94,14 @@ def _ping(ip: str, timeout_ms: int) -> bool:
     else:
         cmd = ["ping", "-c", "1", "-W", str(max(1, timeout_ms // 1000)), ip]
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              timeout=timeout_ms / 1000 + 2.5, creationflags=CREATE_NO_WINDOW)
-        return proc.returncode == 0
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              errors="replace", timeout=timeout_ms / 1000 + 2.5,
+                              creationflags=CREATE_NO_WINDOW)
+        if proc.returncode != 0:
+            return False, 0
+        return True, netprobe.parse_ping_ttl(proc.stdout or "")
     except (subprocess.TimeoutExpired, OSError):
-        return False
+        return False, 0
 
 
 def read_arp_table() -> Dict[str, str]:
@@ -441,6 +446,7 @@ class ScanEngine(QThread):
             thread_ssdp.start()
 
         # 2. Ping-опрос подсети
+        ttl_map: Dict[str, int] = {}
         if ping_works:
             alive: List[str] = []
             total = len(targets)
@@ -453,8 +459,11 @@ class ScanEngine(QThread):
                     done += 1
                     if done % 8 == 0 or done == total:
                         self.progress.emit("phase_ping", done, total)
-                    if future.result():
+                    ok, ttl = future.result()
+                    if ok:
                         alive.append(futures[future])
+                        if ttl:
+                            ttl_map[futures[future]] = ttl
         else:
             # ICMP недоступен — проверяем порты у всех адресов подсети
             alive = list(targets)
@@ -479,7 +488,7 @@ class ScanEngine(QThread):
         self.progress.emit("phase_ports", 0, total_hosts)
 
         def probe(ip: str) -> Optional[Device]:
-            return self._probe_host(ip, arp)
+            return self._probe_host(ip, arp, ttl_map.get(ip, 0))
 
         with ThreadPoolExecutor(max_workers=min(64, total_hosts or 1)) as pool:
             futures = {pool.submit(probe, ip): ip for ip in alive}
@@ -515,7 +524,7 @@ class ScanEngine(QThread):
         self.finished_scan.emit(final)
 
     # Зондирование одного хоста --------------------------------------------
-    def _probe_host(self, ip: str, arp: Dict[str, str]) -> Optional[Device]:
+    def _probe_host(self, ip: str, arp: Dict[str, str], ttl: int = 0) -> Optional[Device]:
         if self._stop.is_set():
             return None
         device = Device(ip=ip)
@@ -533,6 +542,7 @@ class ScanEngine(QThread):
         if not device.ports:
             # хост жив по ping, но порты закрыты — всё равно показываем
             device.evidence.append("Отвечает на ICMP ping")
+        device.ttl = ttl
 
         device.mac = arp.get(ip, "")
         if device.mac:

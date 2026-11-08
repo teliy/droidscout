@@ -101,6 +101,8 @@ class DeviceModel(QAbstractTableModel):
         ]
         if device.model:
             lines.append(f"{i18n.tr('det_model')}: {device.model}")
+        if device.ttl:
+            lines.append(f"TTL: {device.ttl}")
         if device.ssdp_info:
             lines.append(f"UPnP: {device.ssdp_info}")
         if device.evidence:

@@ -7,16 +7,17 @@ import time
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel,
+    QApplication, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter,
     QStatusBar, QTabWidget, QTableView, QToolBar, QToolButton, QVBoxLayout,
     QWidget, QHeaderView, QAbstractItemView)
 
-from .. import __version__, APP_NAME, adb_actions, adb_info, config, exporter, i18n, scanner, storage
+from .. import __version__, APP_NAME, adb_actions, adb_info, config, exporter, i18n, netprobe, scanner, storage
 from ..fingerprint import Device, type_label, verdict_label
 from .device_model import DeviceModel
 from .adb_toolkit import AdbToolkitDialog
+from .deep_scan import DeepScanDialog
 from .dialogs import (AdbInstallDialog, AdbQueryWorker, SettingsDialog,
                       UpdateDialog, UpdateWorker)
 from .theme import apply_theme, app_icon, theme_bg
@@ -168,18 +169,24 @@ class MainWindow(QMainWindow):
         self.details.setMaximumHeight(190)
         self.details.setPlainText(i18n.tr("details_none"))
         details_layout.addWidget(self.details)
-        btn_row = QHBoxLayout()
+        btn_grid = QGridLayout()
+        btn_grid.setContentsMargins(0, 0, 0, 0)
         self.adb_btn = QPushButton(i18n.tr("adb_details"))
         self.adb_btn.clicked.connect(self.query_adb)
-        btn_row.addWidget(self.adb_btn)
+        btn_grid.addWidget(self.adb_btn, 0, 0)
         self.toolkit_btn = QPushButton(i18n.tr("adb_toolkit_btn"))
         self.toolkit_btn.clicked.connect(self.open_toolkit)
-        btn_row.addWidget(self.toolkit_btn)
+        btn_grid.addWidget(self.toolkit_btn, 0, 1)
+        self.deepscan_btn = QPushButton(i18n.tr("deepscan_btn"))
+        self.deepscan_btn.clicked.connect(self.open_deep_scan)
+        btn_grid.addWidget(self.deepscan_btn, 0, 2)
+        self.wol_btn = QPushButton(i18n.tr("wol_btn"))
+        self.wol_btn.clicked.connect(self.wake_device)
+        btn_grid.addWidget(self.wol_btn, 1, 0)
         self.copy_btn = QPushButton(i18n.tr("copy_info"))
         self.copy_btn.clicked.connect(self.copy_details)
-        btn_row.addWidget(self.copy_btn)
-        btn_row.addStretch(1)
-        details_layout.addLayout(btn_row)
+        btn_grid.addWidget(self.copy_btn, 1, 1)
+        details_layout.addLayout(btn_grid)
         splitter.addWidget(details_widget)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
@@ -353,10 +360,20 @@ class MainWindow(QMainWindow):
             self.details.setPlainText(self._details_text(device))
 
     @staticmethod
+    def _ttl_text(device: Device) -> str:
+        if not device.ttl:
+            return "—"
+        guess = netprobe.ttl_guess(device.ttl)
+        if guess:
+            return f"{device.ttl} ({i18n.tr('ttl_' + guess)})"
+        return str(device.ttl)
+
+    @staticmethod
     def _details_text(device: Device) -> str:
         rows = [
             (i18n.tr("det_ip"), device.ip),
             (i18n.tr("det_mac"), device.mac or "—"),
+            (i18n.tr("det_ttl"), MainWindow._ttl_text(device)),
             (i18n.tr("det_vendor"), device.vendor or "—"),
             (i18n.tr("det_hostname"), device.hostname or "—"),
             (i18n.tr("det_type"), type_label(device.device_type)),
@@ -456,6 +473,41 @@ class MainWindow(QMainWindow):
         if not device:
             return
         AdbToolkitDialog(device, self).exec()
+
+    def open_deep_scan(self):
+        row = self.table.selectionModel().currentIndex().row()
+        device = self.model.device_at(row)
+        if not device:
+            return
+        self.deepscan_btn.setEnabled(False)
+
+        def _finished():
+            self.deepscan_btn.setEnabled(True)
+            self.model.add_device(device)
+            self.details.setPlainText(self._details_text(device))
+            self.status_label.setText(i18n.tr("ready"))
+
+        dialog = DeepScanDialog(device, self)
+        # close() только прячет окно; с WA_DeleteOnClose закрытие удалит объект
+        # и сработает destroyed -> обновим карточку и вердикт устройства
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.destroyed.connect(_finished)
+        dialog.show()
+
+    def wake_device(self):
+        row = self.table.selectionModel().currentIndex().row()
+        device = self.model.device_at(row)
+        if not device:
+            return
+        if not device.mac:
+            QMessageBox.information(self, i18n.tr("wol_btn"), i18n.tr("wol_no_mac"))
+            return
+        try:
+            netprobe.wake_on_lan(device.mac)
+            self.status_label.setText(i18n.tr("wol_sent", mac=device.mac))
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, i18n.tr("wol_btn"),
+                                i18n.tr("wol_fail", error=str(exc)[:150]))
 
     def copy_details(self):
         clipboard = QApplication.clipboard()
