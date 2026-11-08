@@ -25,6 +25,7 @@ import socket
 import struct
 import threading
 import time
+from shlex import quote as shlex_quote
 
 from . import config
 
@@ -419,15 +420,15 @@ class AdbDevice:
     def __exit__(self, *_exc):
         self.close()
 
-    # ------------------------------------------------------------- потоки
-    def shell(self, command: str, timeout: "float | None" = None) -> str:
-        """Выполняет команду через 'shell:' и возвращает stdout+stderr."""
+    # ------------------------------------------------------------- потоки данных
+    def _collect(self, service: bytes, timeout: "float | None" = None) -> bytes:
+        """Открывает поток service и собирает вывод до CLSE (бинарно-безопасно)."""
         if not self.sock:
             raise AdbError("not connected")
         local_id = self._local_id
         self._local_id += 2
         output = bytearray()
-        self._send(A_OPEN, local_id, 0, ("shell:" + command).encode("utf-8") + b"\x00")
+        self._send(A_OPEN, local_id, 0, service + b"\x00")
         deadline = _now() + (timeout or self.timeout)
         while True:
             remaining = deadline - _now()
@@ -444,9 +445,23 @@ class AdbDevice:
                 self._send(A_OKAY, local_id, message.arg0)
                 continue
             if message.cmd == A_CLSE and message.arg1 == local_id:
-                return output.decode("utf-8", errors="replace")
+                return bytes(output)
             if message.cmd == A_AUTH:
                 raise AdbError("device restarted authentication mid-session")
+
+    def shell(self, command: str, timeout: "float | None" = None) -> str:
+        """Выполняет команду через 'shell:' и возвращает stdout+stderr."""
+        return self._collect(b"shell:" + command.encode("utf-8"),
+                             timeout).decode("utf-8", errors="replace")
+
+    def shell_bytes(self, command: str, timeout: "float | None" = None) -> bytes:
+        """shell: с бинарным выводом (без декодирования)."""
+        return self._collect(b"shell:" + command.encode("utf-8"), timeout)
+
+    def exec_out(self, command: str, timeout: "float | None" = None) -> bytes:
+        """Сервис 'exec:' — сырой поток без pty: бинарный вывод не искажается
+        (аналог 'adb exec-out'). Подходит для screencap/cat и т.п."""
+        return self._collect(b"exec:" + command.encode("utf-8"), timeout)
 
     # ------------------------------------------------------------- удобства
     def get_properties(self, timeout: "float | None" = None) -> "dict[str, str]":
@@ -457,6 +472,82 @@ class AdbDevice:
 
     def serial(self) -> str:
         return self.shell("getprop ro.serialno", timeout=10).strip()
+
+    def pull_file(self, remote_path: str, timeout: "float | None" = None) -> bytes:
+        """Читает файл с устройства: 'cat' через exec: (бинарно-безопасно).
+        Fallback — base64 (спасает от pty-искажений на старых adbd)."""
+        quoted = shlex_quote(remote_path)
+        data = self.exec_out(f"cat {quoted}", timeout=timeout)
+        if data:
+            return data
+        text = self.shell(f"base64 {quoted}", timeout=timeout)
+        return base64.b64decode(re.sub(r"\s+", "", text)) if text.strip() else b""
+
+    def push_bytes(self, data: bytes, remote_path: str,
+                   timeout: "float | None" = None) -> None:
+        """Кладёт файл на устройство через сервис 'sync:' (SEND/DATA/DONE).
+
+        Соединение не закрывается — можно продолжить работу (например,
+        вызвать shell("pm install …") сразу после передачи APK).
+        """
+        if not self.sock:
+            raise AdbError("not connected")
+        deadline = _now() + (timeout or self.timeout)
+
+        def remaining() -> float:
+            left = deadline - _now()
+            if left <= 0:
+                raise AdbTimeout("sync timeout")
+            return left
+
+        local_id = self._local_id
+        self._local_id += 2
+        self._send(A_OPEN, local_id, 0, b"sync:\x00")
+        got_okay = False
+        while not got_okay:
+            message = self._recv(remaining())
+            if message.cmd == A_OKAY and message.arg1 == local_id:
+                got_okay = True
+            elif message.cmd == A_WRTE and message.arg1 == local_id:
+                self._send(A_OKAY, local_id, message.arg0)
+            elif message.cmd == A_CLSE and message.arg1 == local_id:
+                raise AdbError("sync stream rejected")
+
+        def sync(cmd: bytes, payload: bytes = b"") -> None:
+            # Заголовок sync-кадра: 4-байтовое слово команды + длина
+            self._send(A_WRTE, local_id, 0,
+                       struct.pack("<4sI", cmd, len(payload)) + payload)
+
+        def sync_ack() -> bytes:
+            # читает подтверждение устройства (ACK на WRTE + ответ команды)
+            while True:
+                message = self._recv(remaining())
+                if message.cmd == A_WRTE and message.arg1 == local_id:
+                    self._send(A_OKAY, local_id, message.arg0)
+                    if message.data[:4] in (b"OKAY", b"FAIL", b"QUIT"):
+                        return message.data
+                elif message.cmd == A_OKAY and message.arg1 == local_id:
+                    continue
+                elif message.cmd == A_CLSE and message.arg1 == local_id:
+                    raise AdbError("sync stream closed unexpectedly")
+
+        # Поток-уровня ответ (OKAY/FAIL в данных WRTE) устройство шлёт только
+        # после DONE; промежуточные socket-ACK (A_OKAY) дочитываются в конце.
+        sync(b"SEND", remote_path.encode("utf-8") + b",0644")
+        chunk_size = max(1024, min(self.max_payload, 32 * 1024))
+        for offset in range(0, len(data), chunk_size):
+            sync(b"DATA", data[offset:offset + chunk_size])
+        sync(b"DONE", struct.pack("<I", int(time.time())))
+        answer = sync_ack()
+        if answer[:4] == b"FAIL":
+            size = struct.unpack("<I", answer[4:8])[0] if len(answer) >= 8 else 0
+            reason = answer[8:8 + size].decode("utf-8", "replace") if size else "push failed"
+            raise AdbError(f"sync push failed: {reason}")
+        try:
+            sync(b"QUIT")
+            sync_ack()
+        except (AdbError, AdbTimeout):
+            pass  # устройство уже закрыло поток — не критично
 
     # ------------------------------------------------------------- транспорт
     def _send(self, cmd: int, arg0: int, arg1: int, data: bytes = b""):

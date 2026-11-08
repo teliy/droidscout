@@ -13,9 +13,10 @@ from PySide6.QtWidgets import (
     QStatusBar, QTabWidget, QTableView, QToolBar, QToolButton, QVBoxLayout,
     QWidget, QHeaderView, QAbstractItemView)
 
-from .. import __version__, APP_NAME, adb_info, config, exporter, i18n, scanner, storage
+from .. import __version__, APP_NAME, adb_actions, adb_info, config, exporter, i18n, scanner, storage
 from ..fingerprint import Device, type_label, verdict_label
 from .device_model import DeviceModel
+from .adb_toolkit import AdbToolkitDialog
 from .dialogs import (AdbInstallDialog, AdbQueryWorker, SettingsDialog,
                       UpdateDialog, UpdateWorker)
 from .theme import apply_theme, app_icon, theme_bg
@@ -171,6 +172,9 @@ class MainWindow(QMainWindow):
         self.adb_btn = QPushButton(i18n.tr("adb_details"))
         self.adb_btn.clicked.connect(self.query_adb)
         btn_row.addWidget(self.adb_btn)
+        self.toolkit_btn = QPushButton(i18n.tr("adb_toolkit_btn"))
+        self.toolkit_btn.clicked.connect(self.open_toolkit)
+        btn_row.addWidget(self.toolkit_btn)
         self.copy_btn = QPushButton(i18n.tr("copy_info"))
         self.copy_btn.clicked.connect(self.copy_details)
         btn_row.addWidget(self.copy_btn)
@@ -369,6 +373,11 @@ class MainWindow(QMainWindow):
         if device.extras:
             adb = "; ".join(f"{k}={v}" for k, v in sorted(device.extras.items()))
             rows.append((i18n.tr("adb_result"), adb))
+        if device.extras.get("adb_android_version"):
+            risk = adb_actions.assess_risk(device.extras)
+            level_text = i18n.tr("risk_level_" + risk["level"])
+            rows.append((i18n.tr("det_risk"),
+                         f"{level_text} ({risk['score']})"))
         lines = [f"{name}:  {value}" for name, value in rows]
         if device.evidence:
             lines.append("")
@@ -440,6 +449,13 @@ class MainWindow(QMainWindow):
         self.adb_worker = AdbQueryWorker(device.ip, self)
         self.adb_worker.result.connect(self._on_adb_result)
         self.adb_worker.start()
+
+    def open_toolkit(self):
+        row = self.table.selectionModel().currentIndex().row()
+        device = self.model.device_at(row)
+        if not device:
+            return
+        AdbToolkitDialog(device, self).exec()
 
     def copy_details(self):
         clipboard = QApplication.clipboard()
@@ -538,6 +554,7 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(1, i18n.tr("tab_history"))
         self.details_title.setText(i18n.tr("device_details"))
         self.adb_btn.setText(i18n.tr("adb_details"))
+        self.toolkit_btn.setText(i18n.tr("adb_toolkit_btn"))
         self.copy_btn.setText(i18n.tr("copy_info"))
         self.clear_history_btn.setText(i18n.tr("history_delete"))
         self.model.refresh_headers()

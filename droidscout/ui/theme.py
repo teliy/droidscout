@@ -170,6 +170,14 @@ def theme_bg(theme: str = None) -> str:
     return "#14161b" if theme == "dark" else "#f4f6fa"
 
 
+def is_dark_theme(theme: str = None) -> bool:
+    """True, если активна тёмная тема (для точечной стилизации виджетов)."""
+    if theme is None:
+        from .. import config
+        theme = config.get("theme", "dark")
+    return theme == "dark"
+
+
 def apply_theme(app: QApplication, theme: str = None) -> None:
     """Применяет тему из настроек (или указанную)."""
     from .. import config
