@@ -184,7 +184,8 @@ class ReplWorker(QThread):
                                        should_stop=self._stop_event.is_set)
         except Exception as exc:  # noqa: BLE001 — ошибка не должна ронять диалог
             res = {"port": self.port, "ok": False, "transcript": "",
-                   "answers": {}, "error": str(exc)[:160], "seconds": 0.0}
+                   "answers": {}, "error": str(exc)[:160], "seconds": 0.0,
+                   "pseudo": False}
         res["port"] = self.port
         self.repl_done.emit(res)
 
@@ -561,6 +562,10 @@ class DeepScanDialog(QDialog):
         """Текст REPL-опроса для панели «Сырой ответ» и отчёта."""
         lines = [i18n.tr("ds_repl_title", sec=max(1, int(result.get("seconds") or 0))),
                  "-" * 60]
+        if result.get("pseudo"):
+            # не MicroPython: поясняем, почему в транскрипте «Bad command …»
+            lines.append(i18n.tr("ds_repl_pseudo"))
+            lines.append("-" * 60)
         transcript = str(result.get("transcript") or "").strip()
         if transcript:
             lines.append(transcript)

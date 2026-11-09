@@ -15,6 +15,13 @@ exec("try: ... except: print(error)") — исключение на устрой
 в строку 'DS_... error ...', а не в многострочный traceback, поэтому сессия
 остаётся чистой и все вопросы выполняются до конца.
 
+Псевдо-REPL: некоторые модули (например, Shenzhen iComm на tcp/14035) рисуют
+приглашение '>>> ', но исходники отвергают строкой «Bad command import.» —
+это фирменный интерпретатор с лимитированным набором команд, а не MicroPython.
+Первый вопрос служит разведкой: получив «Bad command …», опрос немедленно
+бросает MicroPython-сценарий и шлёт простые однотокеновые пробы (help, ?,
+version, …) — их полезные ответы попадают в факт «Console: …».
+
 Модуль не зависит от Qt и покрыт тестами scripts/test_repl_probe.py.
 """
 
@@ -93,9 +100,44 @@ REPL_QUESTIONS: List[Tuple[str, str]] = [
     )),
 ]
 
+# Псевдо-REPL: вместо 8 исходников шлём короткие однотокеновые пробы —
+# только чтение; худший ответ — «Bad command …», сессию это не рвёт.
+PSEUDO_PROBES: Tuple[str, ...] = ("help", "?", "version", "ver", "info", "status")
+_BAD_COMMAND_RE = re.compile(r"bad command", re.I)
+
 _MARKER_RE = re.compile(r"^DS_([A-Z]+)[:,]?\s?(.*)$")
 _UNAME_PAIR_RE = re.compile(r"(\w+)='([^']*)'")
 _IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+
+def _ask(sock: socket.socket, cmd: str, wait: float,
+         stop: Callable[[], bool]) -> Optional[bytes]:
+    """Шлёт одну команду и читает ответ до приглашения (None — сокет умер)."""
+    try:
+        sock.sendall(cmd.encode("ascii", "replace") + b"\r\n")
+    except OSError:
+        return None
+    return _read_until_prompt(sock, wait, stop)
+
+
+def _pseudo_notes(text: str) -> str:
+    """Полезные строки из ответов псевдо-REPL.
+
+    Выкидываем «Bad command …», эхо проб и приглашения; приглашение может
+    прилипать к ответу одной строкой («>>> commands: …») — сначала отрезаем.
+    """
+    probes = {p.lower() for p in PSEUDO_PROBES}
+    keep: List[str] = []
+    for line in text.replace(">>> ", "\n").splitlines():
+        s = line.strip()
+        if not s or _BAD_COMMAND_RE.search(s):
+            continue
+        if s in (">>>", "...") or s.startswith("..."):
+            continue
+        if s.lower() in probes or _MARKER_RE.match(s):
+            continue
+        keep.append(s)
+    return "\n".join(keep)[:600]
 
 
 def _ends_with_prompt(buf: bytes) -> bool:
@@ -145,7 +187,8 @@ def interview(ip: str, port: int, *, cmd_wait: float = 2.5,
     started = time.monotonic()
     stop = should_stop or (lambda: False)
     result: Dict[str, object] = {"port": port, "ok": False, "transcript": "",
-                                 "answers": {}, "error": "", "seconds": 0.0}
+                                 "answers": {}, "error": "", "seconds": 0.0,
+                                 "pseudo": False}
     try:
         sock = socket.create_connection((ip, port), timeout=min(3.0, overall))
     except OSError as exc:
@@ -167,15 +210,34 @@ def interview(ip: str, port: int, *, cmd_wait: float = 2.5,
             result["error"] = "REPL prompt (>>>) not seen"
             return result
         parts.append(head)
-        for _key, cmd in REPL_QUESTIONS:
-            if stop() or time.monotonic() - started > overall:
-                break
-            try:
-                sock.sendall(cmd.encode("ascii", "replace") + b"\r\n")
-            except OSError as exc:
-                result["error"] = f"send: {exc}"
-                break
-            parts.append(_read_until_prompt(sock, cmd_wait, stop))
+        # Первый вопрос — разведка языка консоли: MicroPython ответит меткой
+        # DS_IMPL, псевдо-REPL — «Bad command …». Во втором случае остальные
+        # семь вопросов исходников бесполезны — шлём простые пробы.
+        resp = _ask(sock, REPL_QUESTIONS[0][1], cmd_wait, stop)
+        if resp is None:
+            result["error"] = "send failed"
+        else:
+            parts.append(resp)
+            if _BAD_COMMAND_RE.search(resp.decode("utf-8", "replace")):
+                result["pseudo"] = True
+                wait = min(cmd_wait, 1.5)
+                for probe in PSEUDO_PROBES:
+                    if stop() or time.monotonic() - started > overall:
+                        break
+                    resp = _ask(sock, probe, wait, stop)
+                    if resp is None:
+                        result["error"] = "send failed"
+                        break
+                    parts.append(resp)
+            else:
+                for _key, cmd in REPL_QUESTIONS[1:]:
+                    if stop() or time.monotonic() - started > overall:
+                        break
+                    resp = _ask(sock, cmd, cmd_wait, stop)
+                    if resp is None:
+                        result["error"] = "send failed"
+                        break
+                    parts.append(resp)
     finally:
         try:
             sock.close()
@@ -186,7 +248,12 @@ def interview(ip: str, port: int, *, cmd_wait: float = 2.5,
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     result["transcript"] = text[:16384]
     result["answers"] = parse_transcript(text)
+    if result.get("pseudo"):
+        # фактов DS_ не будет — вместо них полезные строки простых проб
+        result["answers"]["pseudo"] = _pseudo_notes(text)
     result["ok"] = bool(result["answers"])
+    if not result["ok"] and not result["error"]:
+        result["error"] = "no answers"      # понятнее, чем «?» в панели
     result["seconds"] = time.monotonic() - started
     return result
 
@@ -198,7 +265,7 @@ def parse_transcript(transcript: str) -> Dict[str, str]:
     или приглашения ('>>> ', '... ' — вместе с эхом следующей команды).
     """
     answers: Dict[str, str] = {}
-    key: str | None = None
+    key: Optional[str] = None
     lines: List[str] = []
 
     def flush():
@@ -316,6 +383,13 @@ def bullets(answers: Dict[str, str]) -> List[str]:
             out.append(f"Free RAM: {answers['mem'].strip()} B")
     except (KeyError, ValueError):
         pass
+    try:
+        if "pseudo" in answers:
+            notes = answers["pseudo"].strip()
+            first = " · ".join(notes.splitlines()[:4])[:120] if notes else ""
+            out.append("Console: " + (first or "rejects import/exec"))
+    except (KeyError, ValueError):
+        pass
     return out
 
 
@@ -327,6 +401,6 @@ def facts_block(answers: Dict[str, str]) -> str:
 def summary_line(answers: Dict[str, str]) -> str:
     """Однострочная сводка для карточки устройства/еvidence. '' — не выяснили."""
     for text in bullets(answers):
-        if text.startswith(("Firmware:", "Board:", "Network:")):
+        if text.startswith(("Firmware:", "Board:", "Network:", "Console:")):
             return text[:160]
     return ""

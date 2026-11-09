@@ -176,6 +176,9 @@ STRINGS = {
         "ds_repl_wait": "REPL-опрос выполняется: прошивка, файлы, main.py, железо, сеть…",
         "ds_repl_fail": "REPL-опрос не удался: {err}",
         "ds_repl_facts": "Что выяснили:",
+        "ds_repl_pseudo": ("Это не MicroPython: консоль отвергает import/exec "
+                           "(ответ «Bad command …»). Посланы простые пробы "
+                           "(help, ?, version, …) — ответы в транскрипте."),
         "ds_repl_evidence": "REPL-опрос: {info}",
         "det_seen": "Обнаружено",
         "det_evidence": "Признаки",
@@ -498,6 +501,9 @@ STRINGS = {
         "ds_repl_wait": "REPL interview in progress: firmware, files, main.py, hardware, network…",
         "ds_repl_fail": "REPL interview failed: {err}",
         "ds_repl_facts": "Findings:",
+        "ds_repl_pseudo": ("Not MicroPython: the console rejects import/exec "
+                           "(\"Bad command ...\"). Simple probes were sent "
+                           "(help, ?, version, ...) — see the transcript."),
         "ds_repl_evidence": "REPL interview: {info}",
         "det_seen": "Seen at",
         "det_evidence": "Evidence",
