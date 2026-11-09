@@ -33,7 +33,7 @@ class MainWindow(QMainWindow):
         self.scan_started = 0.0
         self._last_scan_devices = []
 
-        self.setWindowTitle(i18n.tr("app_title"))
+        self.setWindowTitle(self._base_title())
         self.setWindowIcon(app_icon())
         self.resize(1180, 720)
 
@@ -44,6 +44,10 @@ class MainWindow(QMainWindow):
 
         storage.init()
         self._refresh_history()
+
+    def _base_title(self) -> str:
+        """Шапка программы: имя + версия + назначение (версия просили в шапке)."""
+        return i18n.tr("app_title", version=__version__)
 
     # ------------------------------------------------------------- интерфейс
     def _build_menu(self):
@@ -97,6 +101,11 @@ class MainWindow(QMainWindow):
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         toolbar.addWidget(spacer)
+
+        # версия в шапке — видно без диалога «О программе» и в любом языке
+        self.version_label = QLabel(f"v{__version__}")
+        self.version_label.setStyleSheet("color:#8a90a0; padding: 0 6px;")
+        toolbar.addWidget(self.version_label)
 
         self.theme_btn = QToolButton()
         self.theme_btn.setText(i18n.tr("theme_dark") + " / " + i18n.tr("theme_light"))
@@ -294,7 +303,7 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
         self.status_label.setText(i18n.tr("scanning"))
-        self.setWindowTitle(f"{i18n.tr('scanning')} — {APP_NAME}")
+        self.setWindowTitle(f"{i18n.tr('scanning')} — {APP_NAME} {__version__}")
 
     def stop_scan(self):
         if self.engine:
@@ -322,7 +331,7 @@ class MainWindow(QMainWindow):
         self.scan_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.progress.setVisible(False)
-        self.setWindowTitle(i18n.tr("app_title"))
+        self.setWindowTitle(self._base_title())
 
         devices = devices or []
         self._last_scan_devices = devices
@@ -588,7 +597,7 @@ class MainWindow(QMainWindow):
 
     def retranslate(self):
         i18n.set_language(i18n.detect_language())
-        self.setWindowTitle(i18n.tr("app_title"))
+        self.setWindowTitle(self._base_title())
         self.scan_btn.setText(i18n.tr("scan"))
         self.stop_btn.setText(i18n.tr("scan_stop"))
         self.net_label.setText(i18n.tr("network"))

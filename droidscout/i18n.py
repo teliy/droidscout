@@ -7,7 +7,7 @@ from . import config
 
 STRINGS = {
     "ru": {
-        "app_title": "DroidScout — поиск Android-устройств в сети",
+        "app_title": "DroidScout {version} — поиск Android-устройств в сети",
         "tab_scan": "Сканирование",
         "tab_history": "История",
         "scan": "Сканировать",
@@ -329,7 +329,7 @@ STRINGS = {
         "rec_segment_net": "Изолируйте устройство в отдельной/гостевой сети",
     },
     "en": {
-        "app_title": "DroidScout — Android device network finder",
+        "app_title": "DroidScout {version} — Android device network finder",
         "tab_scan": "Scan",
         "tab_history": "History",
         "scan": "Scan",
