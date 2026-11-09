@@ -15,7 +15,7 @@ import re
 
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QImage, QPixmap
-from PySide6.QtWidgets import (QApplication, QComboBox, QDialog,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                                QFileDialog, QFormLayout, QGridLayout,
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QMessageBox, QPlainTextEdit, QPushButton,
@@ -95,6 +95,7 @@ class AdbToolkitDialog(QDialog):
         self._shot_png = b""
         self._root_info = {}
         self._dev_loaded = False
+        self._pdns_loaded = False
 
         self.setWindowTitle(i18n.tr("toolkit_title", ip=self.ip))
         self.resize(760, 600)
@@ -165,7 +166,8 @@ class AdbToolkitDialog(QDialog):
         form = QFormLayout(page)
         self.stat_labels = {}
         for key in ("stat_battery", "stat_memory", "stat_disk", "stat_display",
-                    "stat_uptime", "stat_device_ip", "stat_root"):
+                    "stat_thermal", "stat_load", "stat_uptime",
+                    "stat_device_ip", "stat_root"):
             label = QLabel("—")
             label.setTextInteractionFlags(Qt.TextSelectableByMouse)
             self.stat_labels[key] = label
@@ -177,6 +179,33 @@ class AdbToolkitDialog(QDialog):
         btn_row.addWidget(refresh_btn)
         btn_row.addStretch(1)
         form.addRow(btn_row)
+
+        screen_box = QGroupBox(i18n.tr("screen_group"))
+        screen_grid = QGridLayout(screen_box)
+        self._wm_fn = {"size": adb_actions.wm_size_set,
+                       "density": adb_actions.wm_density_set,
+                       "overscan": adb_actions.wm_overscan_set}
+        self._wm_buttons = {}
+        for row, (kind, label_key, placeholder) in enumerate((
+                ("size", "screen_size", "1920x1080"),
+                ("density", "screen_density", "160"),
+                ("overscan", "screen_overscan", "-40,-40,-40,-40"))):
+            screen_grid.addWidget(QLabel(i18n.tr(label_key)), row, 0)
+            edit = QLineEdit()
+            edit.setPlaceholderText(placeholder)
+            setattr(self, f"screen_{kind}_input", edit)
+            screen_grid.addWidget(edit, row, 1)
+            apply_btn = QPushButton(i18n.tr("screen_apply"))
+            apply_btn.clicked.connect(lambda _=False, k=kind: self._wm_apply(k))
+            screen_grid.addWidget(apply_btn, row, 2)
+            reset_btn = QPushButton(i18n.tr("screen_reset"))
+            reset_btn.clicked.connect(lambda _=False, k=kind: self._wm_reset(k))
+            screen_grid.addWidget(reset_btn, row, 3)
+            self._wm_buttons[kind] = (apply_btn, reset_btn)
+        screen_hint = QLabel(i18n.tr("screen_hint"))
+        screen_hint.setWordWrap(True)
+        screen_grid.addWidget(screen_hint, 3, 0, 1, 4)
+        form.addRow(screen_box)
 
         reboot_box = QGroupBox(i18n.tr("reboot_group"))
         reboot_row = QHBoxLayout(reboot_box)
@@ -221,6 +250,40 @@ class AdbToolkitDialog(QDialog):
         dev_form.addLayout(btn_row)
         layout.addWidget(dev_box)
 
+        pdns_box = QGroupBox(i18n.tr("pdns_group"))
+        pdns_form = QVBoxLayout(pdns_box)
+        pdns_cur = QHBoxLayout()
+        pdns_cur.addWidget(QLabel(i18n.tr("pdns_current")))
+        self.pdns_value_label = QLabel("—")
+        self.pdns_value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        pdns_cur.addWidget(self.pdns_value_label, 1)
+        pdns_form.addLayout(pdns_cur)
+        pdns_hint = QLabel(i18n.tr("pdns_hint"))
+        pdns_hint.setWordWrap(True)
+        pdns_form.addWidget(pdns_hint)
+        pdns_row = QHBoxLayout()
+        self.pdns_mode = QComboBox()
+        for label_key, mode in (("pdns_mode_off", "off"),
+                                ("pdns_mode_opp", "opportunistic"),
+                                ("pdns_mode_host", "hostname")):
+            self.pdns_mode.addItem(i18n.tr(label_key), mode)
+        self.pdns_mode.currentIndexChanged.connect(self._pdns_mode_changed)
+        pdns_row.addWidget(self.pdns_mode)
+        self.pdns_host = QLineEdit()
+        self.pdns_host.setPlaceholderText("dns.adguard.com")
+        pdns_row.addWidget(self.pdns_host, 1)
+        pdns_form.addLayout(pdns_row)
+        pdns_btns = QHBoxLayout()
+        self.pdns_apply_btn = QPushButton(i18n.tr("pdns_apply"))
+        self.pdns_apply_btn.clicked.connect(self._pdns_apply)
+        pdns_btns.addWidget(self.pdns_apply_btn)
+        self.pdns_refresh_btn = QPushButton(i18n.tr("pdns_refresh"))
+        self.pdns_refresh_btn.clicked.connect(self._pdns_refresh)
+        pdns_btns.addWidget(self.pdns_refresh_btn)
+        pdns_btns.addStretch(1)
+        pdns_form.addLayout(pdns_btns)
+        layout.addWidget(pdns_box)
+
         set_box = QGroupBox(i18n.tr("set_group"))
         set_form = QVBoxLayout(set_box)
         ns_row = QHBoxLayout()
@@ -257,10 +320,13 @@ class AdbToolkitDialog(QDialog):
         return page
 
     def _maybe_load_settings(self, index):
-        """Значение флага читается при первом открытии вкладки, а не при
-        старте диалога — лишнее соединение только по запросу."""
-        if not self._dev_loaded and self.tabs.widget(index) is self._settings_page:
-            self.refresh_dev_mode()
+        """Значения флагов читаются при первом открытии вкладки, а не при
+        старте диалога — лишние соединения только по запросу."""
+        if self.tabs.widget(index) is self._settings_page:
+            if not self._dev_loaded:
+                self.refresh_dev_mode()
+            if not self._pdns_loaded:
+                self._pdns_refresh()
 
     def refresh_dev_mode(self):
         self._busy()
@@ -383,6 +449,64 @@ class AdbToolkitDialog(QDialog):
         box.appendPlainText(output.rstrip() or i18n.tr("shell_empty"))
         box.appendPlainText("")
 
+    # ------------------------------------------------------- Private DNS
+    def _pdns_refresh(self):
+        self.pdns_refresh_btn.setEnabled(False)
+        self._busy()
+        self._run(self._on_pdns, adb_actions.private_dns_get, self.ip)
+
+    def _on_pdns(self, value, exc):
+        self.pdns_refresh_btn.setEnabled(True)
+        self._pdns_loaded = True
+        if exc:
+            self._failed(exc)
+            return
+        self._idle()
+        self._show_pdns(value or {})
+
+    @staticmethod
+    def _pdns_mode_label(mode):
+        key = {"off": "pdns_mode_off", "opportunistic": "pdns_mode_opp",
+               "hostname": "pdns_mode_host"}.get(mode)
+        if key:
+            return i18n.tr(key)
+        return i18n.tr("pdns_mode_null") if mode == "null" else mode
+
+    def _show_pdns(self, value):
+        mode = (value or {}).get("mode", "null")
+        hostname = (value or {}).get("hostname", "")
+        index = self.pdns_mode.findData(mode)
+        if index >= 0:
+            self.pdns_mode.setCurrentIndex(index)
+        self.pdns_host.setText(hostname)
+        shown = self._pdns_mode_label(mode)
+        if hostname:
+            shown += " → " + hostname
+        self.pdns_value_label.setText(shown)
+
+    def _pdns_mode_changed(self, _index):
+        self.pdns_host.setEnabled(self.pdns_mode.currentData() == "hostname")
+
+    def _pdns_apply(self):
+        mode = self.pdns_mode.currentData() or "off"
+        hostname = self.pdns_host.text().strip()
+        if mode == "hostname" and not hostname:
+            self.status.setText(i18n.tr("pdns_host_required"))
+            return
+        self.pdns_apply_btn.setEnabled(False)
+        self._busy()
+        self._run(lambda value, exc: self._on_pdns_set(value, exc),
+                  adb_actions.private_dns_set, self.ip, mode, hostname)
+
+    def _on_pdns_set(self, value, exc):
+        self.pdns_apply_btn.setEnabled(True)
+        if exc:
+            self._failed(exc)
+            return
+        self._idle()
+        self._show_pdns(value or {})
+        self.status.setText(i18n.tr("pdns_done"))
+
     def refresh_stats(self):
         self._busy()
         self._run(self._on_stats, adb_actions.read_stats, self.ip)
@@ -416,9 +540,29 @@ class AdbToolkitDialog(QDialog):
                     used=disk.get("used_pct", "?"),
                     mount=disk.get("mount", "?")) if disk else "—")
         display = stats.get("display") or {}
-        self.stat_labels["stat_display"].setText(
-            i18n.tr("stat_display_fmt", size=display.get("size", "?"),
-                    density=display.get("density", "?")) if display else "—")
+        if display:
+            size = display.get("size", "?")
+            if display.get("override_size"):
+                size = f"{size} → {display['override_size']}"
+            density = display.get("density", "?")
+            if display.get("override_density"):
+                density = f"{density} → {display['override_density']}"
+            self.stat_labels["stat_display"].setText(
+                i18n.tr("stat_display_fmt", size=size, density=density))
+        else:
+            self.stat_labels["stat_display"].setText("—")
+        thermal = stats.get("thermal") or {}
+        if thermal.get("temp_c") is not None:
+            self.stat_labels["stat_thermal"].setText(
+                i18n.tr("stat_thermal_fmt", temp=thermal["temp_c"]))
+        else:
+            self.stat_labels["stat_thermal"].setText("—")
+        load = stats.get("load") or {}
+        if load:
+            self.stat_labels["stat_load"].setText(i18n.tr(
+                "stat_load_fmt", l1=load["l1"], l5=load["l5"], l15=load["l15"]))
+        else:
+            self.stat_labels["stat_load"].setText("—")
         uptime = stats.get("uptime_sec")
         if uptime:
             days, rest = divmod(int(uptime), 86400)
@@ -448,6 +592,10 @@ class AdbToolkitDialog(QDialog):
             self.stat_labels["stat_root"].setText(
                 f"uid={uid} ({user}){root_note} | su: "
                 + (self._root_info.get("su_path") or "—"))
+        if hasattr(self, "shell_su"):
+            su_found = bool(self._root_info.get("su_found"))
+            self.shell_su.setEnabled(su_found)
+            self.shell_su.setToolTip("" if su_found else i18n.tr("shell_su_none"))
 
     def _update_risk(self):
         """Риск-бейдж: live-данные + свойства из последнего опроса."""
@@ -489,6 +637,34 @@ class AdbToolkitDialog(QDialog):
             self._failed(exc)
         else:
             self.status.setText(i18n.tr("reboot_sent"))
+
+    # ------------------------------------------------------------- экран (wm)
+    def _wm_apply(self, kind):
+        value = getattr(self, f"screen_{kind}_input").text().strip()
+        if not value:
+            self.status.setText(i18n.tr("screen_value_required"))
+            return
+        self._wm_set(kind, value)
+
+    def _wm_reset(self, kind):
+        self._wm_set(kind, "reset")
+
+    def _wm_set(self, kind, value):
+        for btn in self._wm_buttons[kind]:
+            btn.setEnabled(False)
+        self._busy()
+        self._run(lambda out, exc: self._on_wm_done(kind, value, out, exc),
+                  self._wm_fn[kind], self.ip, value)
+
+    def _on_wm_done(self, kind, value, _out, exc):
+        for btn in self._wm_buttons[kind]:
+            btn.setEnabled(True)
+        if exc:
+            self._failed(exc)
+            return
+        self._idle()
+        self.status.setText(i18n.tr("screen_done", cmd=kind, value=value))
+        self.refresh_stats()
 
     # ------------------------------------------------------------ таб: Приложения
     def _tab_apps(self):
@@ -981,6 +1157,9 @@ class AdbToolkitDialog(QDialog):
         self.files_download_btn = QPushButton(i18n.tr("files_download"))
         self.files_download_btn.clicked.connect(self._file_download)
         actions.addWidget(self.files_download_btn)
+        self.files_upload_btn = QPushButton(i18n.tr("files_upload"))
+        self.files_upload_btn.clicked.connect(self._file_upload)
+        actions.addWidget(self.files_upload_btn)
         actions.addStretch(1)
         layout.addLayout(actions)
         return page
@@ -1074,6 +1253,26 @@ class AdbToolkitDialog(QDialog):
         self.status.setText(i18n.tr("files_saved", path=path,
                                     count=len(data or b"")))
 
+    def _file_upload(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, i18n.tr("files_upload"), os.path.expanduser("~"),
+            "All files (*);;APK (*.apk)")
+        if not path:
+            return
+        self.files_upload_btn.setEnabled(False)
+        self._busy("files_uploading")
+        self._run(lambda remote, exc: self._on_file_uploaded(remote, exc),
+                  adb_actions.push_file, self.ip, path,
+                  self.files_path.text().strip() or "/")
+
+    def _on_file_uploaded(self, remote, exc):
+        self.files_upload_btn.setEnabled(True)
+        if exc:
+            self._failed(exc)
+            return
+        self.status.setText(i18n.tr("files_uploaded", path=remote))
+        self.refresh_files()
+
     # --------------------------------------------------------------- таб: Консоль
     def _tab_shell(self):
         page = QWidget()
@@ -1088,6 +1287,9 @@ class AdbToolkitDialog(QDialog):
         self.shell_input.setPlaceholderText(i18n.tr("shell_hint"))
         self.shell_input.returnPressed.connect(self.run_shell)
         row.addWidget(self.shell_input, 1)
+        self.shell_su = QCheckBox(i18n.tr("shell_su"))
+        self.shell_su.setToolTip(i18n.tr("shell_su_none"))
+        row.addWidget(self.shell_su)
         self.shell_run_btn = QPushButton(i18n.tr("shell_run"))
         self.shell_run_btn.clicked.connect(self.run_shell)
         row.addWidget(self.shell_run_btn)
@@ -1102,12 +1304,15 @@ class AdbToolkitDialog(QDialog):
         command = self.shell_input.text().strip()
         if not command:
             return
+        sent = command
+        if self.shell_su.isChecked():
+            sent = "su -c " + adb_actions.shlex_quote(command)
         self._shell_history.append(command)
         self._shell_index = len(self._shell_history)
         self.shell_run_btn.setEnabled(False)
         self._busy()
         self._run(lambda out, exc: self._on_shell(out, exc),
-                  adb_actions.shell, self.ip, command)
+                  adb_actions.shell, self.ip, sent)
 
     def _on_shell(self, output, exc):
         self.shell_run_btn.setEnabled(True)

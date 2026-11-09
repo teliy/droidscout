@@ -14,6 +14,7 @@
 
 import base64
 import datetime
+import os
 import re
 import time
 
@@ -596,6 +597,39 @@ def install_apk(host: str, apk_path: str, port: int = 5555,
 
 
 # ---------------------------------------------------------------- файлы
+def push_file(host: str, local_path: str, remote_dir: str,
+              port: int = 5555, timeout: float = 180.0) -> str:
+    """Локальный файл с ПК -> устройство (sync SEND). Возвращает удалённый путь.
+
+    Имя файла сохраняется: /sdcard + 'photo.jpg' -> '/sdcard/photo.jpg'.
+    Копирование идёт с правами 0644 — для /system нужен root-remount,
+    штатные цели — /sdcard и /data/local/tmp.
+    """
+    name = os.path.basename((local_path or "").replace("\\", "/")).strip()
+    if not name:
+        raise ActionError(f"bad local path: {local_path!r}", "")
+    try:
+        with open(local_path, "rb") as f:
+            data = f.read()
+    except OSError as exc:
+        raise ActionError(str(exc), "") from exc
+    if not data:
+        raise ActionError(f"empty file: {local_path}", "")
+    base = (remote_dir or "/").strip() or "/"
+    remote = (base.rstrip("/") + "/" + name) if base != "/" else "/" + name
+    device = _open(host, port, max(timeout, 30.0))
+    try:
+        journal.event(f"{host}:{port}", f"push {len(data)} B -> {remote}")
+        device.push_bytes(data, remote, timeout=timeout)
+    except (AdbError, AdbTimeout, OSError) as exc:
+        journal.error(f"{host}:{port}", "push", exc)
+        raise ActionError(str(exc), "conn") from exc
+    finally:
+        device.close()
+    journal.event(f"{host}:{port}", f"push ok: {remote} ({len(data)} B)")
+    return remote
+
+
 _LS_DATE_RE = re.compile(
     r"(\d{4}-\d{2}-\d{2}|\w{3}\s+\d{1,2})\s+(\d{2}:\d{2}|\d{4})\s+(.*)$")
 
@@ -797,6 +831,9 @@ STATS_COMMAND = (
     "echo ==MEM; cat /proc/meminfo 2>/dev/null; "
     "echo ==DISK; df 2>/dev/null; "
     "echo ==WM; wm size 2>/dev/null; wm density 2>/dev/null; "
+    "echo ==THERMAL; dumpsys thermal 2>/dev/null | grep -i -m 8 cpu; "
+    "cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null; "
+    "echo ==LOAD; cat /proc/loadavg 2>/dev/null; "
     "echo ==UP; cat /proc/uptime 2>/dev/null; "
     "echo ==NET; ip -f inet addr show 2>/dev/null || netcfg 2>/dev/null; "
     "echo ==END"
@@ -892,15 +929,68 @@ def parse_battery(text: str) -> dict:
 
 
 def parse_wm(text: str) -> dict:
-    """'wm size'+'wm density' -> {size, density}."""
+    """'wm size'+'wm density' -> {size, density[, override_size,
+    override_density]}. Поля override_* появляются, когда разрешение/плотность
+    переопределены командой 'wm size/density' — UI показывает обе величины."""
     out = {}
     match = re.search(r"Physical size:\s*(\d+x\d+)", text)
     if match:
         out["size"] = match.group(1)
+    match = re.search(r"Override size:\s*(\d+x\d+)", text)
+    if match:
+        out["override_size"] = match.group(1)
     match = re.search(r"Physical density:\s*(\d+)", text)
     if match:
         out["density"] = match.group(1)
+    match = re.search(r"Override density:\s*(\d+)", text)
+    if match:
+        out["override_density"] = match.group(1)
     return out
+
+
+def parse_thermal(text: str) -> dict:
+    """Температура CPU из вывода `dumpsys thermal | grep -i cpu` и/или
+    /sys/class/thermal/thermal_zone*/temp.
+
+    Формат dumpsys бывает разный:
+      '0, CPU, 55.0, 60.0, 1, 0, …'  (таблица ThermalService)
+      'Temperature{mType=CPU, mValue=55.0, …}'
+    поэтому берём первое дробное число в диапазоне 20–120 °C из строк,
+    где упоминается CPU. Если dumpsys не дал результата — пробуем sysfs:
+    там целые миллиградусы (55000 -> 55.0), берём первое ненулевое.
+    """
+    def cpu_temp(line: str) -> "float | None":
+        for match in re.finditer(r"(\d+\.\d+)", line):
+            value = float(match.group(1))
+            if 20.0 <= value <= 120.0:
+                return value
+        return None
+
+    for line in (text or "").splitlines():
+        low = line.lower()
+        if "cpu" not in low or "thermal_zone" in low:
+            continue
+        value = cpu_temp(line)
+        if value is not None:
+            return {"temp_c": value, "via": "dumpsys"}
+    for line in (text or "").splitlines():
+        if "thermal_zone" not in line:
+            continue
+        match = re.search(r"\b(\d{4,6})\b", line)
+        if match:
+            value = int(match.group(1)) / 1000.0
+            if 20.0 <= value <= 120.0:
+                return {"temp_c": value, "via": "sysfs"}
+    return {}
+
+
+def parse_loadavg(text: str) -> dict:
+    """/proc/loadavg -> {l1, l5, l15} — средняя загрузка CPU."""
+    match = re.match(r"\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)", (text or "").strip())
+    if not match:
+        return {}
+    return {"l1": float(match.group(1)), "l5": float(match.group(2)),
+            "l15": float(match.group(3))}
 
 
 def parse_uptime(text: str) -> float:
@@ -952,6 +1042,14 @@ def read_stats(host: str, port: int = 5555, timeout: float = 20.0) -> dict:
         ip = parse_ip_addr(sections["NET"])
         if ip:
             stats["device_ip"] = ip
+    if "THERMAL" in sections and sections["THERMAL"].strip():
+        thermal = parse_thermal(sections["THERMAL"])
+        if thermal:
+            stats["thermal"] = thermal
+    if "LOAD" in sections and sections["LOAD"].strip():
+        load = parse_loadavg(sections["LOAD"])
+        if load:
+            stats["load"] = load
     return stats
 
 
@@ -970,6 +1068,98 @@ def check_root(host: str, port: int = 5555, timeout: float = 12.0) -> dict:
     info["sdk"] = sections.get("SDK", "").strip()
     info["android_version"] = sections.get("REL", "").strip()
     return info
+
+
+# ---------------------------------------------------------------- экран (wm)
+_SIZE_RE = re.compile(r"^\d{2,5}x\d{2,5}$")
+_DENSITY_RE = re.compile(r"^\d{2,4}$")
+_OVERSCAN_VALUE = (-1000, 1000)
+
+
+def wm_size_set(host: str, value: str, port: int = 5555,
+                timeout: float = 10.0) -> str:
+    """'wm size WxH' — переопределение разрешения; 'reset' — откат.
+
+    Лечит и «обрезанную» телевизором картинку, и фейковое разрешение
+    прошивки (реальные пиксели видно в «Инфо» → Экран).
+    """
+    value = (value or "").strip()
+    if value != "reset" and not _SIZE_RE.match(value):
+        raise ActionError(f"bad size: {value!r} (ожидается WxH, например 1920x1080)", "")
+    return shell(host, f"wm size {value}", port, timeout).strip()
+
+
+def wm_density_set(host: str, value: str, port: int = 5555,
+                   timeout: float = 10.0) -> str:
+    """'wm density N' — плотность (dpi); 'reset' — откат."""
+    value = (value or "").strip()
+    if value != "reset" and not _DENSITY_RE.match(value):
+        raise ActionError(f"bad density: {value!r} (ожидается число, например 160)", "")
+    return shell(host, f"wm density {value}", port, timeout).strip()
+
+
+def wm_overscan_set(host: str, value: str, port: int = 5555,
+                    timeout: float = 10.0) -> str:
+    """'wm overscan L,T,R,B' — поля экрана; 'reset' — откат.
+
+    Отрицательные значения «раздвигают» картинку за физические края —
+    штатный способ убрать чёрные рамки на ТВ; положительные — сжать,
+    если телевизор срезает края интерфейса. Валидация: четыре целых
+    в ±1000, без пробелов.
+    """
+    value = (value or "").strip()
+    if value != "reset":
+        parts = [p.strip() for p in value.split(",")]
+        if len(parts) != 4 or not all(p.lstrip("-").isdigit() for p in parts):
+            raise ActionError(
+                f"bad overscan: {value!r} (ожидается Л,В,П,Н, например -40,-40,-40,-40)", "")
+        if not all(_OVERSCAN_VALUE[0] <= int(p) <= _OVERSCAN_VALUE[1] for p in parts):
+            raise ActionError(
+                f"overscan out of range: {value!r} (допустимо ±{_OVERSCAN_VALUE[1]})", "")
+        value = ",".join(parts)
+    return shell(host, f"wm overscan {value}", port, timeout).strip()
+
+
+# ---------------------------------------------------------------- Private DNS
+PDNS_MODE_KEY = "private_dns_mode"
+PDNS_HOST_KEY = "private_dns_hostname"
+PDNS_MODES = ("off", "opportunistic", "hostname")
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+                          r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$")
+
+
+def private_dns_get(host: str, port: int = 5555,
+                    timeout: float = 10.0) -> dict:
+    """Текущий Private DNS: {'mode': str, 'hostname': str}.
+
+    mode — off/opportunistic/hostname либо 'null' (не задан: Android
+    по умолчанию считает это opportunistic). hostname — '' для всех
+    режимов, кроме hostname.
+    """
+    mode = get_setting(host, "global", PDNS_MODE_KEY, port, timeout)
+    hostname = get_setting(host, "global", PDNS_HOST_KEY, port, timeout)
+    if hostname in ("", "null", "none"):
+        hostname = ""
+    return {"mode": mode or "null", "hostname": hostname}
+
+
+def private_dns_set(host: str, mode: str, hostname: str = "",
+                    port: int = 5555, timeout: float = 10.0) -> dict:
+    """Установка Private DNS (DNS-over-TLS) — блокирует рекламу/трекеры
+    на уровне всей системы. Для 'hostname' требуется имя хоста провайдера
+    (dns.adguard.com и т.п.); оно проверяется по форме домена.
+    Возвращает фактическое состояние после записи.
+    """
+    if mode not in PDNS_MODES:
+        raise ActionError(f"unknown private dns mode: {mode!r}", "")
+    if mode == "hostname":
+        hostname = (hostname or "").strip().rstrip(".")
+        if not _HOSTNAME_RE.match(hostname):
+            raise ActionError(
+                f"bad dns hostname: {hostname!r} (пример: dns.adguard.com)", "")
+        put_setting(host, "global", PDNS_HOST_KEY, hostname, port, timeout)
+    put_setting(host, "global", PDNS_MODE_KEY, mode, port, timeout)
+    return private_dns_get(host, port, timeout)
 
 
 # ---------------------------------------------------------------- settings
