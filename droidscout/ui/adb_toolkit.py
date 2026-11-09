@@ -526,6 +526,9 @@ class AdbToolkitDialog(QDialog):
         details_btn = QPushButton(i18n.tr("apps_info"))
         details_btn.clicked.connect(self._app_details)
         actions2.addWidget(details_btn)
+        self.apk_btn = QPushButton(i18n.tr("apps_apk_dl"))
+        self.apk_btn.clicked.connect(self._app_apk)
+        actions2.addWidget(self.apk_btn)
         self.install_btn = QPushButton(i18n.tr("apps_install"))
         self.install_btn.clicked.connect(self._install_apk)
         actions2.addWidget(self.install_btn)
@@ -626,6 +629,36 @@ class AdbToolkitDialog(QDialog):
             self._failed(exc)
             return
         self.status.setText(i18n.tr("apps_export_saved", path=path, count=count))
+
+    def _app_apk(self):
+        """APK выбранного приложения -> файл на ПК (base + сплиты)."""
+        item = self.apps_tree.currentItem()
+        if not item:
+            QMessageBox.information(self, i18n.tr("adb_result"),
+                                    i18n.tr("apps_select"))
+            return
+        package = item.data(0, Qt.UserRole) or item.text(0)
+        # колонка «APK» — запасной путь на случай, если pm path молчит
+        fallback = item.text(3)
+        path, _ = QFileDialog.getSaveFileName(
+            self, i18n.tr("apps_apk_dl"), f"{package}.apk",
+            "APK (*.apk);;All files (*)")
+        if not path:
+            return
+        self.apk_btn.setEnabled(False)
+        self._busy("apps_apk_saving")
+        self._run(lambda saved, exc: self._on_app_apk(path, saved, exc),
+                  adb_actions.download_app_apk, self.ip, package, path,
+                  fallback)
+
+    def _on_app_apk(self, dest, saved, exc):
+        self.apk_btn.setEnabled(True)
+        if exc:
+            self._failed(exc)
+            return
+        saved = saved or [dest]
+        self.status.setText(i18n.tr("apps_apk_saved",
+                                    count=len(saved), path=saved[0]))
 
     def _selected_package(self):
         item = self.apps_tree.currentItem()

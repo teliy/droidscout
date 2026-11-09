@@ -656,6 +656,80 @@ def pull_file(host: str, remote_path: str, port: int = 5555,
     return data
 
 
+# ------------------------------------------------------------ выгрузка APK
+def parse_pm_path(text: str) -> "list[str]":
+    """Вывод 'pm path <pkg>' -> список путей APK (base + сплиты)."""
+    paths: "list[str]" = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("package:"):
+            continue
+        path = line[len("package:"):].strip()
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def app_apk_paths(host: str, package: str, port: int = 5555,
+                  timeout: float = 20.0, fallback_path: str = "") -> "list[str]":
+    """Пути APK приложения: 'pm path <pkg>', фолбэк — путь из списка.
+
+    pm path — канонический источник: показывает base.apk и сплиты даже
+    тогда, когда `pm list packages -f` молчал или дал путь без имени файла
+    (каталог вида /data/app/com.x-XXXX==). Если pm path не ответил
+    (кривые прошивки), используем известный путь: *.apk — как есть,
+    каталог — дополняем '/base.apk'.
+    """
+    try:
+        text = shell(host, f"pm path {shlex_quote(package)}", port, timeout)
+    except ActionError:
+        text = ""                      # pm path отказал — идём в фолбэк
+    paths = parse_pm_path(text)
+    if paths:
+        return paths
+    fallback = (fallback_path or "").strip()
+    if fallback.lower().endswith(".apk"):
+        return [fallback]
+    if fallback:
+        return [fallback.rstrip("/") + "/base.apk"]
+    raise ActionError(f"pm path не нашёл «{package}», "
+                      f"и путь APK в списке неизвестен", "")
+
+
+def download_app_apk(host: str, package: str, dest: str, port: int = 5555,
+                     timeout: float = 300.0,
+                     fallback_path: str = "") -> "list[str]":
+    """APK приложения с устройства -> файл(ы) на ПК. Список сохранённых путей.
+
+    Сплиты (base + split_*.apk) пишутся рядом с выбранным в диалоге путём:
+    второй файл получает суффикс _2, третий _3 — меньше лишних вопросов.
+    Большой APK по Wi-Fi может качаться долго, поэтому таймаут щедрый;
+    ошибка чтения любого файла прерывает выгрузку (скачанное остаётся).
+    """
+    paths = app_apk_paths(host, package, port=port, timeout=timeout,
+                          fallback_path=fallback_path)
+    journal.event(f"{host}:{port}",
+                  f"APK {package}: {len(paths)} file(s) -> {dest}")
+    saved: "list[str]" = []
+    for index, remote in enumerate(paths):
+        data = pull_file(host, remote, port=port, timeout=timeout)
+        if not data:
+            raise ActionError(f"empty reply: {remote}", "conn")
+        if index == 0:
+            local = dest
+        else:
+            stem, dot, ext = dest.rpartition(".")
+            local = f"{stem}_{index + 1}.{ext}" if dot and stem \
+                else f"{dest}_{index + 1}"
+        try:
+            with open(local, "wb") as f:
+                f.write(data)
+        except OSError as exc:
+            raise ActionError(str(exc), "") from exc
+        saved.append(local)
+    return saved
+
+
 # ---------------------------------------------------------------- статистика
 STATS_COMMAND = (
     "echo ==BATTERY; dumpsys battery 2>/dev/null; "
