@@ -533,7 +533,9 @@ class AdbToolkitDialog(QDialog):
         self._idle()
         self.apps_tree.clear()
         for app in apps or []:
-            item = QTreeWidgetItem([app["package"], "", app.get("path", "")])
+            # version/path пустые строки, если обогащение не добрало данных
+            item = QTreeWidgetItem([app["package"], app.get("version") or "",
+                                    app.get("path", "")])
             item.setData(0, Qt.UserRole, app["package"])
             self.apps_tree.addTopLevelItem(item)
         status_text = i18n.tr("apps_found", count=len(apps or []))

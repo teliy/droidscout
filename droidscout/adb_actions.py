@@ -167,27 +167,157 @@ def reboot(host: str, mode: str = "", port: int = 5555, timeout: float = 6.0) ->
 
 
 # ---------------------------------------------------------------- приложения
-def parse_pm_list(text: str) -> "list[tuple[str, str]]":
-    """'pm list packages [-f]' -> [(package, apk_path|'')]."""
+def parse_pm_list(text: str) -> "list[tuple[str, str, str]]":
+    """'pm list packages [-f] [--show-versioncode]' -> [(package, apk, version)].
+
+    Умеет все встречающиеся форматы строки:
+
+      package:/data/app/com.a/base.apk=com.a                    (-f)
+      package:com.a                                             (голый список)
+      package:com.a versionCode=12 versionName=1.2.3            (--show-versioncode)
+      package:/data/app/com.a/base.apk=com.a versionCode=12 versionName=1.2.3
+
+    Версия '' — если в строке её не было.
+    """
     result = []
     for line in (text or "").splitlines():
         line = line.strip()
         if not line.startswith("package:"):
             continue
-        body = line[len("package:"):]
+        body = line[len("package:"):].strip()
+        if not body:
+            continue
+        version = ""
+        match = re.search(r"\bversionName=(\S+)", body)
+        if match:
+            version = match.group(1)
+        # Хвост «versionCode=… versionName=…» отрезаем — имя пакета чистое
+        cut = re.search(r"\s+(?:versionCode|versionName)=\S+", body)
+        if cut:
+            body = body[:cut.start()].strip()
         if "=" in body:
             path, name = body.split("=", 1)
         else:
             path, name = "", body
         name = name.strip()
         if name:
-            result.append((name, path.strip()))
+            result.append((name, path.strip(), version))
     return result
+
+
+def parse_dumpsys_all(text: str) -> "dict[str, dict]":
+    """Полный вывод 'dumpsys package' -> {package: {version, code, path…}}.
+
+    Один запрос вместо перебора пакетов по одному: секции начинаются
+    строкой «Package [имя] (хэш):», внутри лежат versionName=…,
+    versionCode=…, codePath=…. Первое вхождение пакета выигрывает
+    (повторы в «Hidden system packages» — дубликаты). Пустой словарь —
+    разбор не удался (кривая прошивка, «Permission denial» и т.п.).
+    """
+    source = text or ""
+    starts = [(match.start(), match.group(1))
+              for match in re.finditer(r"Package \[([^\]\s]+)\]", source)]
+    out = {}
+    for idx, (pos, name) in enumerate(starts):
+        if name in out:
+            continue
+        end = starts[idx + 1][0] if idx + 1 < len(starts) else len(source)
+        info = parse_dumpsys_package(source[pos:end])
+        if info:
+            out[name] = info
+    return out
+
+
+def _enrich_apps(host: str, port: int, timeout: float, apps: "list[dict]",
+                 kind_flag: str, failed: "set[str]", ok_command: str = "") -> None:
+    """Добирает пути APK и версии, которых не было в базовом списке.
+
+    До трёх шагов, каждый — под журналом; ошибка любого шага (кривой pm,
+    запрет dumpsys) не роняет список — соответствующая колонка остаётся
+    пустой:
+
+      1. `pm list packages -f <kind> --show-versioncode` — пути и версии;
+      2. `pm list packages -f <kind>`                    — пути;
+      3. `dumpsys package` одним куском                  — версии.
+
+    ok_command — базовая команда, уже вернувшая список: шаг 2 не станет
+    повторять её (тот же вывод новой информации не даст), failed — набор
+    команд, на которых базовая цепочка уже получила пустоту.
+    """
+    index = {app["package"]: app for app in apps}
+
+    def missing(field: str) -> bool:
+        return any(not app.get(field) for app in apps)
+
+    def merge(entries: "list[tuple[str, str, str]]", where: str) -> None:
+        hits = 0
+        for name, path, version in entries:
+            app = index.get(name)
+            if not app:
+                continue
+            if path and not app.get("path"):
+                app["path"] = path
+                hits += 1
+            if version and not app.get("version"):
+                app["version"] = version
+                hits += 1
+        journal.event(f"{host}:{port}",
+                      f"обогащение ({where}): {len(entries)} строк, "
+                      f"заполнено полей {hits}")
+
+    # 1) пути + версии одним запросом (--show-versioncode есть не везде:
+    #    старые pm печатают usage-ошибку — тогда ответ не разберётся)
+    if missing("path") or missing("version"):
+        command = " ".join(filter(None, ("pm list packages -f", kind_flag,
+                                         "--show-versioncode")))
+        try:
+            text = shell(host, command, port, timeout)
+            merge(parse_pm_list(text), command)
+        except ActionError as exc:
+            journal.event(f"{host}:{port}", f"обогащение не удалось: {exc}")
+
+    # 2) пути без versioncode — то, что уже отказало (failed) или уже
+    #    вернуло базовый список (ok_command), второй раз не запрашивается
+    if missing("path"):
+        command = " ".join(filter(None, ("pm list packages -f", kind_flag)))
+        if command == ok_command or command in failed:
+            journal.event(f"{host}:{port}",
+                          f"обогащение ({command}): пропуск — уже отвечала")
+        else:
+            try:
+                text = shell(host, command, port, timeout)
+                merge(parse_pm_list(text), command)
+            except ActionError as exc:
+                journal.event(f"{host}:{port}", f"обогащение не удалось: {exc}")
+
+    # 3) версии: полный dumpsys package одним запросом — медленнее и
+    #    «толще», зато работает даже там, где pm не знает ни -f, ни
+    #    --show-versioncode. Заодно закрывает codePath, если пути нет.
+    if missing("version") or missing("path"):
+        try:
+            text = shell(host, "dumpsys package", port, timeout)
+            infos = parse_dumpsys_all(text)
+            filled = 0
+            for name, info in infos.items():
+                app = index.get(name)
+                if not app:
+                    continue
+                if info.get("version") and not app.get("version"):
+                    app["version"] = info["version"]
+                    filled += 1
+                if info.get("path") and not app.get("path"):
+                    app["path"] = info["path"]
+                    filled += 1
+            journal.event(f"{host}:{port}",
+                          f"dumpsys package: секций {len(infos)}, "
+                          f"заполнено полей {filled}")
+        except ActionError as exc:
+            journal.event(f"{host}:{port}", f"dumpsys package недоступен: {exc}")
 
 
 def list_apps(host: str, kind: str = "third", port: int = 5555,
               timeout: float = 20.0) -> "list[dict]":
-    """Список пакетов. kind: 'third' (-3), 'system' (-s), 'all'.
+    """Список пакетов: {package, path, version}. kind: 'third' (-3), 'system' (-s), 'all'.
 
     На части прошивок `pm` отвергает флаги (-f/-3/-s) или молча отдаёт
     пустоту на комбинацию, которая работает в консоли пользователя.
@@ -197,6 +327,11 @@ def list_apps(host: str, kind: str = "third", port: int = 5555,
       third:  `pm list packages -3`  →  `-f -3`  →  `-f` (только /data/*)
       system: `pm list packages -s`  →  `-f -s`  →  `-f` (только /system|product|vendor)
       all:    `pm list packages`     →  `-f`
+
+    Первый удачный ответ часто содержит только имена (голый `-3`/`-s`),
+    а колонки «Версия» и «APK» остаются пустыми — их добирает
+    _enrich_apps: -f с --show-versioncode, затем голый -f, затем полный
+    dumpsys package. Любая ошибка обогащения не роняет список.
     """
     chains = {
         "third": ("-3", "-f -3", "-f"),
@@ -204,26 +339,35 @@ def list_apps(host: str, kind: str = "third", port: int = 5555,
         "all": ("", "-f"),
     }
     variants = chains.get(kind, chains["third"])
+    failed: "set[str]" = set()
+    apps: "list[dict]" = []
     for attempt, flags in enumerate(variants):
-        text = shell(host, f"pm list packages {flags}".rstrip(), port, timeout)
-        parsed = parse_pm_list(text)                 # [(package, path), …]
+        command = f"pm list packages {flags}".rstrip()
+        text = shell(host, command, port, timeout)
+        parsed = parse_pm_list(text)                 # [(package, apk, version)]
         if flags == "-f" and kind in ("third", "system"):
             # Прямой путь к пути APK: отделяем сторонние от системных сами
             prefixes = ("/data",) if kind == "third" else ("/system", "/product", "/vendor")
-            parsed = [(name, path) for name, path in parsed
+            parsed = [(name, path, version) for name, path, version in parsed
                       if path.startswith(prefixes)]
         if parsed:
             if attempt:
                 journal.event(f"{host}:{port}",
                               f"pm list: попытка {attempt + 1} ({flags or 'без флагов'}) "
                               f"— {len(parsed)} пакетов")
-            apps = [{"package": name, "path": path} for name, path in parsed]
-            apps.sort(key=lambda item: item["package"].lower())
-            return apps
+            apps = [{"package": name, "path": path, "version": version}
+                    for name, path, version in parsed]
+            break
+        failed.add(command)
         journal.event(f"{host}:{port}",
                       f"pm list ({flags or 'без флагов'}): 0 пакетов, "
                       f"сырой ответ {len(text)} B — в журнале")
-    return []
+    if not apps:
+        return []
+    _enrich_apps(host, port, timeout, apps, variants[0], failed,
+                 ok_command=command)
+    apps.sort(key=lambda item: item["package"].lower())
+    return apps
 
 
 def parse_dumpsys_package(text: str) -> dict:
