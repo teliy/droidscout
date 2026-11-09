@@ -19,9 +19,10 @@ exec("try: ... except: print(error)") — исключение на устрой
 приглашение '>>> ', но исходники отвергают строкой «Bad command import.» —
 это фирменный интерпретатор с лимитированным набором команд, а не MicroPython.
 Первый вопрос служит разведкой: получив «Bad command …», опрос бросает
-MicroPython-сценарий и ищет живые команды консоли — сначала явные пробы
-(help, ?, version, …), затем словарь типовых однотокеновых команд (get, show,
-ifconfig, at+gmr, …); их ответы попадают в факт «Console: …».
+MicroPython-сценарий и ищет живые команды консоли тремя волнами: явные пробы
+(help, ?, version, …), словарь типовых однотокеновых команд (get, show,
+ifconfig, at+gmr, …) и справка по найденным живым командам (help ls, ls ?) —
+их ответы попадают в факт «Console: …».
 
 Модуль не зависит от Qt и покрыт тестами scripts/test_repl_probe.py.
 """
@@ -108,6 +109,8 @@ PSEUDO_PROBES: Tuple[str, ...] = ("help", "?", "version", "ver", "info", "status
 # Словарь типовых команд фирменных консолей (только чтение, без аргументов):
 # без аргументов почти всё отвечает usage-подсказкой — из неё видно синтаксис.
 # Пишущих команд (set/write/reset/upgrade/erase/exit) здесь нет и не будет.
+# Вторая половина — nouns модулей камер/шлюзов: модели, клиенты, прошивка,
+# разделы, журнал ядра — именно они попадают в фирменные консоли (iComm: ls).
 PSEUDO_DICT: Tuple[str, ...] = (
     "sysinfo", "system", "usage", "man", "show", "get", "dump", "list", "read",
     "ip", "mac", "wifi", "wlan", "net", "ifconfig", "iwconfig", "netstat", "arp",
@@ -116,7 +119,16 @@ PSEUDO_DICT: Tuple[str, ...] = (
     "gpio", "adc", "pwm", "pin", "key", "button", "sensor",
     "ls", "dir", "cat", "env", "cfg", "config", "boot", "log", "debug", "test",
     "at", "at+gmr", "at+version", "at+gmac", "at+csq", "echo", "print",
+    "models", "model", "fw", "firmware", "build", "pwd", "whoami", "hostname",
+    "dns", "dhcp", "route", "clients", "devices", "scan", "camera", "channel",
+    "stream", "rtsp", "onvif", "isp", "sd", "storage", "mtd", "dmesg",
+    "language", "menu", "cloud", "server", "user", "users", "manufacturer",
+    "vendor", "product", "board", "sku", "ntp", "tz",
 )
+
+# Справочные допробы для живых команд: «usage: …» раскрывает синтаксис
+# и следующие команды консоли (реальный случай: ls -> «Zero models exist.»).
+PSEUDO_HELP: Tuple[str, ...] = ("help {cmd}", "{cmd} help", "{cmd} ?", "{cmd} -h")
 
 _BAD_COMMAND_RE = re.compile(r"bad command", re.I)
 
@@ -286,6 +298,26 @@ def interview(ip: str, port: int, *, cmd_wait: float = 2.5,
                             live.append((probe, rtxt))
                 if not live and sent:
                     result["pseudo_dict"] = f"{sent} probed, all rejected"
+                # Волна 3: справка по живым командам — «usage: …» подсказывает
+                # синтаксис и следующие команды (живой случай: ls отвечает,
+                # а help ls раскрывает аргументы). Не больше трёх команд,
+                # чтобы опрос не растягивался на минуты.
+                if not result["error"]:
+                    for base, _reply in live[:3]:
+                        for tpl in PSEUDO_HELP:
+                            probe = tpl.format(cmd=base)
+                            if stop() or time.monotonic() - started > overall:
+                                break
+                            resp = _ask(sock, probe, wait, stop)
+                            if resp is None:
+                                result["error"] = "send failed"
+                                break
+                            rtxt = resp.decode("utf-8", "replace")
+                            if not _BAD_COMMAND_RE.search(rtxt):
+                                parts.append(resp)
+                                live.append((probe, rtxt))
+                        if result["error"]:
+                            break
             else:
                 for _key, cmd in REPL_QUESTIONS[1:]:
                     if stop() or time.monotonic() - started > overall:

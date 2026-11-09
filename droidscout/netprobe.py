@@ -267,6 +267,10 @@ def _adb_identity(raw: bytes) -> str:
     bits = [b for b in (model, name, device) if b]
     if bits:
         return "ADB: " + ", ".join(bits)
+    if len(raw) < 30:
+        # реальный случай (iComm): adbd шлёт только 24-байтовый заголовок
+        # без identity — порт всё равно ADB, просто модель не узнали
+        return "ADB (CNXN, no identity)"
     return "ADB (Android Debug Bridge)"
 
 
@@ -374,8 +378,9 @@ def classify_banner(port: int, raw: bytes) -> Tuple[str, str]:
     if raw.startswith(b"RTSP/"):
         return "rtsp", first_line.decode("latin-1", "replace").strip()
 
-    # ADB-over-TCP: adbd отвечает рукопожатием CNXN и сразу выдаёт идентичность
-    if raw.startswith(b"CNXN") and len(raw) >= 30:
+    # ADB-over-TCP: adbd отвечает рукопожатием CNXN и сразу выдаёт идентичность;
+    # заголовок без identity — тоже ADB (часть сборок identity не присылает)
+    if raw.startswith(b"CNXN") and len(raw) >= 24:
         return "adb", _adb_identity(raw)
 
     if raw.startswith(b"+OK"):
@@ -461,10 +466,14 @@ def probe_port(ip: str, port: int, timeout: float = 2.5) -> Dict[str, object]:
         # 1) ждём баннер сервера
         raw = _recv_some(sock, 1.2 if port in SERVER_FIRST else 0.7)
         # ADB: часть сборок adbd шлёт свой CNXN сразу после соединения,
-        # остальным отправляем своё рукопожатие и читаем ответ
-        if port in ADB_PORTS and not raw.startswith(b"CNXN"):
+        # остальным отправляем своё рукопожатие и читаем ответ. Спонтанный
+        # CNXN без identity (только 24-байтовый заголовок, реальный случай
+        # iComm) — не повод молчать: шлём и своё рукопожатие, у части сборок
+        # identity приходит только в ответ на наш CNXN.
+        if port in ADB_PORTS and (not raw.startswith(b"CNXN")
+                                  or len(raw) < 30):
             reply = _adb_probe(sock, min(2.0, timeout))
-            if reply:
+            if reply and len(reply) > len(raw):
                 raw = reply
         # 2) зонды по типу порта
         if not raw:
