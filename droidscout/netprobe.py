@@ -172,10 +172,146 @@ HTTP_PORTS = {80, 81, 88, 591, 3128, 3000, 5000, 7000, 8000, 8008, 8080,
               8081, 8088, 8090, 8443, 8899, 9000, 9080, 9090, 32400, 36669,
               6466, 49152, 49153, 49154}
 RTSP_PORTS = {554, 8554}
+# Порты ADB-over-TCP: рукопожатие CNXN не требует авторизации, и adbd в
+# ответе сам сообщает версию протокола и идентичность (модель/имя устройства)
+ADB_PORTS = {5555}
 
 _HTTP_REQ = ("GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: DroidScout/1\r\n"
              "Accept: */*\r\nConnection: close\r\n\r\n")
 _RTSP_REQ = ("OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: DroidScout/1\r\n\r\n")
+
+# Версия протокола и лимит полезной нагрузки для A_CNXN (как у официального adb)
+A_VERSION = 0x01000001
+ADB_MAX_PAYLOAD = 4096
+_ADB_CNXN = 0x4E584E43          # "CNXN" в little-endian
+
+
+def _recv_exact(sock, count: int, deadline_s: float) -> bytes:
+    """Читает ровно count байт (или меньше, если собеседник закрыл/молчит)."""
+    buf = b""
+    end = time.monotonic() + max(0.05, deadline_s)
+    sock.settimeout(max(0.05, deadline_s))
+    while len(buf) < count and time.monotonic() < end:
+        try:
+            part = sock.recv(count - len(buf))
+        except (socket.timeout, TimeoutError):
+            break
+        except OSError:
+            break
+        if not part:
+            break
+        buf += part
+    return buf
+
+
+def _recv_until_prompt(sock, wait: float = 1.2, limit: int = 4096) -> bytes:
+    """Читает, пока в конце не появится приглашение REPL или не выйдет окно."""
+    chunks: List[bytes] = []
+    size = 0
+    deadline = time.monotonic() + wait
+    sock.settimeout(0.4)
+    while size < limit and time.monotonic() < deadline:
+        try:
+            part = sock.recv(512)
+        except (socket.timeout, TimeoutError, OSError):
+            continue
+        if not part:
+            break
+        chunks.append(part)
+        size += len(part)
+        tail = part.rstrip()
+        if tail.endswith(b">>>") or tail.endswith(b"..."):
+            break
+    return b"".join(chunks)
+
+
+def _adb_probe(sock, timeout: float) -> bytes:
+    """Шлёт A_CNXN и читает ответ adbd. b'' — это не ADB."""
+    data = b"host::features=cmd,stat_v2,shell_v2\x00"
+    header = struct.pack("<6I", _ADB_CNXN, A_VERSION, ADB_MAX_PAYLOAD,
+                         len(data), sum(data) & 0xFFFFFFFF,
+                         _ADB_CNXN ^ 0xFFFFFFFF)
+    try:
+        sock.sendall(header + data)
+    except OSError:
+        return b""
+    head = _recv_exact(sock, 24, timeout)
+    if len(head) < 24 or head[:4] != b"CNXN":
+        return b""
+    dlen = min(struct.unpack("<I", head[16:20])[0], 4096)
+    if not dlen:
+        return head
+    return head + _recv_exact(sock, dlen, timeout)
+
+
+def _adb_props(raw: bytes) -> Tuple[str, str, str]:
+    """(model, name, device) из данных A_CNXN: 'device::ro.product…'."""
+    data = raw[24:1048]
+    end = data.find(b"\x00")
+    if end >= 0:
+        data = data[:end]
+    text = data.decode("utf-8", "replace").split("::", 1)[-1]
+    props: Dict[str, str] = {}
+    for part in text.split(";"):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            props[key.strip()] = value.strip()
+    return (props.get("ro.product.model", ""),
+            props.get("ro.product.name", ""),
+            props.get("ro.product.device", ""))
+
+
+def _adb_identity(raw: bytes) -> str:
+    """Короткое человекочитаемое описание из A_CNXN."""
+    model, name, device = _adb_props(raw)
+    bits = [b for b in (model, name, device) if b]
+    if bits:
+        return "ADB: " + ", ".join(bits)
+    return "ADB (Android Debug Bridge)"
+
+
+# --- опознавание Python-REPL: два безопасных print-запроса ----------------
+
+_REPL_Q_IMPL = b"import sys; print(sys.implementation.name)\r\n"
+_REPL_Q_UNAME = b"import os; print(os.uname())\r\n"
+
+_UNAME_RE = re.compile(
+    r"sysname='([^']*)'\s*,\s*nodename='[^']*'\s*,\s*release='([^']*)'"
+    r"(?:\s*,\s*version='[^']*')?\s*,\s*machine='([^']*)'", re.S)
+
+
+def _repl_identify(sock) -> bytes:
+    """Задаёт REPL-консоли два безобидных вопроса и собирает ответы.
+
+    Только print — ничего не меняет на устройстве. Работает и с MicroPython,
+    и с CPython; эхо команд оседает в транскрипте и не мешает разбору.
+    """
+    out = b""
+    for probe in (_REPL_Q_IMPL, _REPL_Q_UNAME):
+        try:
+            sock.sendall(probe)
+        except OSError:
+            break
+        out += _recv_until_prompt(sock, 1.2)
+    return out
+
+
+def _repl_summary(raw: bytes) -> str:
+    """Кто отвечает в REPL: версия и платформа из транскрипта. '' — не выяснили."""
+    text = raw.decode("latin-1", "replace")
+    m = _UNAME_RE.search(text)
+    if m:
+        sysname, release, machine = (g.strip() for g in m.groups())
+        bits = [b for b in (sysname, release, machine) if b]
+        if bits:
+            return "Python REPL: " + " ".join(bits)
+    m = re.search(r"MicroPython (v[0-9][^;\r\n]*); ([^\r\n]+)", text)
+    if m:
+        return f"Python REPL: MicroPython {m.group(1)} ({m.group(2).strip()})"
+    m = re.search(r"(?m)^(micropython|cpython)\s*$", text)
+    if m:
+        return f"Python REPL: {m.group(1)}"
+    return ""
 
 
 def _recv_some(sock, wait: float, limit: int = 2048) -> bytes:
@@ -237,6 +373,10 @@ def classify_banner(port: int, raw: bytes) -> Tuple[str, str]:
 
     if raw.startswith(b"RTSP/"):
         return "rtsp", first_line.decode("latin-1", "replace").strip()
+
+    # ADB-over-TCP: adbd отвечает рукопожатием CNXN и сразу выдаёт идентичность
+    if raw.startswith(b"CNXN") and len(raw) >= 30:
+        return "adb", _adb_identity(raw)
 
     if raw.startswith(b"+OK"):
         return "pop3", first_line.decode("latin-1", "replace").strip()
@@ -320,6 +460,12 @@ def probe_port(ip: str, port: int, timeout: float = 2.5) -> Dict[str, object]:
 
         # 1) ждём баннер сервера
         raw = _recv_some(sock, 1.2 if port in SERVER_FIRST else 0.7)
+        # ADB: часть сборок adbd шлёт свой CNXN сразу после соединения,
+        # остальным отправляем своё рукопожатие и читаем ответ
+        if port in ADB_PORTS and not raw.startswith(b"CNXN"):
+            reply = _adb_probe(sock, min(2.0, timeout))
+            if reply:
+                raw = reply
         # 2) зонды по типу порта
         if not raw:
             if port in RTSP_PORTS:
@@ -347,6 +493,10 @@ def probe_port(ip: str, port: int, timeout: float = 2.5) -> Dict[str, object]:
                 raw = _recv_some(sock, 1.5)
             except OSError:
                 pass
+        # 5) Python-REPL: спросим консоль, кто она — только print, безопасно
+        if (raw.endswith(b">>> ") or raw.endswith(b"... ")
+                or b"MicroPython" in raw[:256]):
+            raw += _repl_identify(sock)
     except OSError as exc:
         result["detail"] = str(exc)[:160]
         return result
@@ -360,6 +510,18 @@ def probe_port(ip: str, port: int, timeout: float = 2.5) -> Dict[str, object]:
     # HTTP-зонд попал в не-HTTP службу — не выдаём её за http
     if proto in ("http", "https") and not raw.startswith((b"HTTP/", b"ICY ")):
         proto, detail = "tcp", raw[:48].hex(" ") if raw else ""
+    if proto == "adb":
+        model, name, device = _adb_props(raw)
+        if model:
+            result["adb_model"] = model
+        if name:
+            result["adb_name"] = name
+        if device:
+            result["adb_device"] = device
+    elif proto == "repl":
+        summary = _repl_summary(raw)
+        if summary:
+            detail = summary
     result["proto"] = proto
     result["detail"] = detail or result["detail"]
     result["raw"] = raw[:8192]

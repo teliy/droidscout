@@ -29,14 +29,14 @@ from .. import i18n, netprobe
 
 # Протоколы, которые попадают в device.services (осмысленные службы)
 _SERVICE_KEYS = {"http", "https", "ssh", "ftp", "smtp", "pop3", "imap",
-                 "rtsp", "vnc", "telnet", "redis", "irc", "repl"}
+                 "rtsp", "vnc", "telnet", "redis", "irc", "repl", "adb"}
 
 # Цвета сервисов в таблице (подходят и для тёмной, и для светлой темы)
 SERVICE_COLORS = {
     "http": "#3b82f6", "https": "#14b8a6", "ssh": "#22c55e", "ftp": "#f97316",
     "smtp": "#ec4899", "pop3": "#ec4899", "imap": "#ec4899", "rtsp": "#8b5cf6",
     "vnc": "#ef4444", "telnet": "#f43f5e", "redis": "#d97706", "irc": "#64748b",
-    "repl": "#d946ef", "binary": "#64748b", "tcp": "#64748b",
+    "repl": "#d946ef", "adb": "#06b6d4", "binary": "#64748b", "tcp": "#64748b",
 }
 
 _UDP_PROBES = (("mdns", "mDNS", netprobe.mdns_probe),
@@ -578,6 +578,14 @@ class DeepScanDialog(QDialog):
                 device.services.add(proto)
             if proto == "http" and not device.http_banner:
                 device.http_banner = str(info.get("detail") or "")[:200]
+            # ADB-рукопожатие (CNXN) не требует авторизации — из него можно
+            # достать модель даже без полного ADB-доступа
+            if proto == "adb" and not device.model:
+                model = str(info.get("adb_model") or "")
+                if model:
+                    device.model = model
+                    device.evidence.append(
+                        i18n.tr("ds_evidence_adb_model", model=model))
         if self._by_port:
             device.evidence.append(i18n.tr("ds_evidence", n=len(self._by_port)))
         for key, label, _fn in _UDP_PROBES:
