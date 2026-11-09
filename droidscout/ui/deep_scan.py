@@ -135,6 +135,22 @@ class DeepScanWorker(QThread):
             self.failed.emit(str(exc))
 
 
+def _device_context(device) -> str:
+    """Строка контекста устройства для журнала: IP, MAC, имя, производитель.
+
+    Журнал опроса часто копируют или сохраняют отдельно, поэтому без IP/MAC
+    он бесполезен — добавляем их в каждую выдачу (запрос пользователя).
+    """
+    parts = [f"IP: {device.ip}"]
+    if device.mac:
+        parts.append(f"MAC: {device.mac}")
+    if device.hostname:
+        parts.append(str(device.hostname))
+    if device.vendor:
+        parts.append(str(device.vendor))
+    return " · ".join(parts)
+
+
 def _hexdump(data: bytes, limit: int = 512) -> str:
     lines = []
     for offset in range(0, min(len(data), limit), 16):
@@ -470,7 +486,9 @@ class DeepScanDialog(QDialog):
             self.raw.setPlainText("")
             return
         raw = info.get("raw") or b""
-        lines = [f"tcp/{info['port']}" + (" TLS" if info.get("tls") else "")]
+        lines = [_device_context(self.device),
+                 "",
+                 f"tcp/{info['port']}" + (" TLS" if info.get("tls") else "")]
         if info.get("cert_cn") or info.get("cert_issuer"):
             lines.append(f"cert CN: {info.get('cert_cn') or '—'}"
                          f" | issuer: {info.get('cert_issuer') or '—'}")
@@ -509,6 +527,14 @@ class DeepScanDialog(QDialog):
                 fh.write(f"IP: {self.device.ip}\n")
                 if self.device.mac:
                     fh.write(f"MAC: {self.device.mac}\n")
+                if self.device.hostname:
+                    fh.write(f"{i18n.tr('det_hostname')}: "
+                             f"{self.device.hostname}\n")
+                if self.device.vendor:
+                    fh.write(f"{i18n.tr('det_vendor')}: "
+                             f"{self.device.vendor}\n")
+                if self.device.ttl:
+                    fh.write(f"TTL: {self.device.ttl}\n")
                 fh.write(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S\n"))
                 fh.write(i18n.tr("ds_stat_open", n=len(self._results)) + "\n")
                 fh.write("=" * 64 + "\n")

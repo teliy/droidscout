@@ -338,6 +338,15 @@ def probe_port(ip: str, port: int, timeout: float = 2.5) -> Dict[str, object]:
                 raw = _recv_some(sock, 0.8)
             except OSError:
                 pass
+        # 4) совсем молчит — контрольный «пинок» с запасным окном: медленные
+        #    REPL/IoT-консоли отвечают на Enter с задержкой до секунд, поэтому
+        #    без этого шага одна и та же служба то ловится, то «нет ответа»
+        if not raw and port not in HTTP_PORTS and port not in TLS_PORTS:
+            try:
+                sock.sendall(b"\r\n")
+                raw = _recv_some(sock, 1.5)
+            except OSError:
+                pass
     except OSError as exc:
         result["detail"] = str(exc)[:160]
         return result
