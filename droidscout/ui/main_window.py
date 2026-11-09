@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QWidget, QHeaderView, QAbstractItemView)
 
 from .. import __version__, APP_NAME, adb_actions, adb_info, config, exporter, i18n, netprobe, scanner, storage
+from .. import fingerprint
 from ..fingerprint import Device, type_label, verdict_label
 from .device_model import DeviceModel
 from .adb_toolkit import AdbToolkitDialog
@@ -336,13 +337,8 @@ class MainWindow(QMainWindow):
         self._update_counts(devices)
 
     def _mark_new_devices(self, devices):
-        macs, ips = storage.seen_macs_and_ips()
-        # Исключаем текущее сканирование: seen вызывается до сохранения
-        for device in devices:
-            if device.mac and macs:
-                device.is_new = device.mac not in macs
-            else:
-                device.is_new = bool(ips) and device.ip not in ips
+        # Пустышки «только ping» не помечаются новыми — см. fingerprint.mark_new
+        fingerprint.mark_new(devices, *storage.seen_macs_and_ips())
 
     def _update_counts(self, devices=None):
         devices = self.model.devices if devices is None else devices

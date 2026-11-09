@@ -19,6 +19,7 @@ NEW_COLOR = QColor(46, 204, 113, 36)
 ANDROID_COLOR = QColor(46, 204, 113)
 LIKELY_COLOR = QColor(241, 196, 15)
 NO_COLOR = QColor(149, 165, 166)
+MUTED_COLOR = QColor(122, 130, 136)   # строки-пустышки «только ping»
 
 
 class DeviceModel(QAbstractTableModel):
@@ -73,13 +74,17 @@ class DeviceModel(QAbstractTableModel):
             if column == "status":
                 return i18n.tr("status_new") if device.is_new else ""
             return ""
-        if role == Qt.ForegroundRole and column == "confidence":
-            if device.verdict == "android":
-                return ANDROID_COLOR
-            if device.verdict == "likely":
-                return LIKELY_COLOR
-            return NO_COLOR
-        if role == Qt.BackgroundRole and device.is_new:
+        if role == Qt.ForegroundRole:
+            if device.ping_only:
+                # хост виден только по ping — гасим всю строку серым
+                return MUTED_COLOR
+            if column == "confidence":
+                if device.verdict == "android":
+                    return ANDROID_COLOR
+                if device.verdict == "likely":
+                    return LIKELY_COLOR
+                return NO_COLOR
+        if role == Qt.BackgroundRole and device.is_new and not device.ping_only:
             return NEW_COLOR
         if role == Qt.FontRole and column in ("ip", "mac"):
             font = QFont()
@@ -109,6 +114,9 @@ class DeviceModel(QAbstractTableModel):
             lines.append("")
             lines.append(i18n.tr("det_evidence") + ":")
             lines.extend("  • " + ev for ev in device.evidence[:8])
+        if device.ping_only:
+            lines.append("")
+            lines.append(i18n.tr("tooltip_ping_only"))
         return "\n".join(lines)
 
     # Мутации ------------------------------------------------------------------

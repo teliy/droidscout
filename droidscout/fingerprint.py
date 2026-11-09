@@ -32,6 +32,14 @@ class Device:
     seen_ts: float = field(default_factory=time.time)
     is_new: bool = False
 
+    @property
+    def ping_only(self) -> bool:
+        """Хост доказал только отклик на ping: ни MAC, ни портов, ни имён,
+        ни служб — идентифицировать нечего (строка-пустышка)."""
+        return not (self.mac or self.ports or self.services or self.hostname
+                    or self.model or self.manufacturer or self.ssdp_info
+                    or self.extras)
+
     def merge(self, other: "Device") -> None:
         """Дополняет данные этого устройства данными из другого источника."""
         for src, dst in (("mac", "mac"), ("hostname", "hostname"),
@@ -50,6 +58,23 @@ class Device:
         for ev in other.evidence:
             if ev not in self.evidence:
                 self.evidence.append(ev)
+
+
+def mark_new(devices: List[Device], seen_macs: set, seen_ips: set) -> None:
+    """Помечает устройства, которых не было в прошлых сканированиях.
+
+    Пустышки «только ping» (нет ни MAC, ни портов, ни имён) новинками не
+    считаются — иначе таблица после первого же скана становится сплошной
+    зелёной.
+    """
+    for device in devices:
+        if device.ping_only:
+            device.is_new = False
+            continue
+        if device.mac and seen_macs:
+            device.is_new = device.mac not in seen_macs
+        else:
+            device.is_new = bool(seen_ips) and device.ip not in seen_ips
 
 
 def type_label(device_type: str) -> str:

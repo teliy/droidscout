@@ -28,6 +28,8 @@ STRINGS = {
         "col_status": "Статус",
         "status_new": "НОВОЕ",
         "status_known": "известное",
+        "tooltip_ping_only": "Отвечает только на ping — MAC и порты недоступны. "
+                             "Попробуйте кнопку «Все порты» для глубокого опроса.",
         "device_details": "Детали устройства",
         "details_none": "Выберите устройство в таблице, чтобы увидеть подробную информацию.",
         "adb_details": "ADB: запросить детали",
@@ -338,6 +340,8 @@ STRINGS = {
         "col_status": "Status",
         "status_new": "NEW",
         "status_known": "known",
+        "tooltip_ping_only": "Responds to ping only — no MAC or ports visible. "
+                             "Try the All Ports button for a deep probe.",
         "device_details": "Device details",
         "details_none": "Select a device in the table to see full information.",
         "adb_details": "ADB: query details",

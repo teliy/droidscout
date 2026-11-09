@@ -449,6 +449,7 @@ class ScanEngine(QThread):
 
         # 2. Ping-опрос подсети
         ttl_map: Dict[str, int] = {}
+        ping_proven: Set[str] = set()   # хосты, реально ответившие на ICMP
         if ping_works:
             alive: List[str] = []
             total = len(targets)
@@ -464,10 +465,12 @@ class ScanEngine(QThread):
                     ok, ttl = future.result()
                     if ok:
                         alive.append(futures[future])
+                        ping_proven.add(futures[future])
                         if ttl:
                             ttl_map[futures[future]] = ttl
         else:
-            # ICMP недоступен — проверяем порты у всех адресов подсети
+            # ICMP недоступен — зондируем все адреса по TCP; хост без единого
+            # признака жизни (порты/MAC/DNS) будет отфильтрован в _probe_host
             alive = list(targets)
 
         # hosts, найденные через mDNS/SSDP, но не ответившие на ping — тоже проверяем
@@ -490,7 +493,8 @@ class ScanEngine(QThread):
         self.progress.emit("phase_ports", 0, total_hosts)
 
         def probe(ip: str) -> Optional[Device]:
-            return self._probe_host(ip, arp, ttl_map.get(ip, 0))
+            return self._probe_host(ip, arp, ttl_map.get(ip, 0),
+                                    proven=ip in ping_proven)
 
         with ThreadPoolExecutor(max_workers=min(64, total_hosts or 1)) as pool:
             futures = {pool.submit(probe, ip): ip for ip in alive}
@@ -526,7 +530,18 @@ class ScanEngine(QThread):
         self.finished_scan.emit(final)
 
     # Зондирование одного хоста --------------------------------------------
-    def _probe_host(self, ip: str, arp: Dict[str, str], ttl: int = 0) -> Optional[Device]:
+    @staticmethod
+    def _worth_showing(device: Device, proven: bool) -> bool:
+        """Есть ли у хоста доказательства жизни.
+
+        proven=True — хост ответил на ICMP (или найден mDNS/SSDP), показываем
+        всегда. Иначе (TCP-фолбэк при заблокированном ICMP) показываем только
+        если есть хоть что-то: открытый порт, MAC из ARP или имя хоста.
+        """
+        return proven or bool(device.ports or device.mac or device.hostname)
+
+    def _probe_host(self, ip: str, arp: Dict[str, str], ttl: int = 0,
+                    proven: bool = True) -> Optional[Device]:
         if self._stop.is_set():
             return None
         device = Device(ip=ip)
@@ -541,9 +556,6 @@ class ScanEngine(QThread):
                     device.ports.add(port)
                     device.services.add(label)
 
-        if not device.ports:
-            # хост жив по ping, но порты закрыты — всё равно показываем
-            device.evidence.append("Отвечает на ICMP ping")
         device.ttl = ttl
 
         device.mac = arp.get(ip, "")
@@ -563,6 +575,13 @@ class ScanEngine(QThread):
 
         # Обратный DNS
         device.hostname = _reverse_dns(ip)
+
+        if not self._worth_showing(device, proven):
+            # ни ping, ни портов, ни MAC, ни DNS — пустышка, не шумим таблицей
+            return None
+        if proven and not device.ports:
+            # хост жив по ping, но порты закрыты — всё равно показываем
+            device.evidence.append("Отвечает на ICMP ping")
 
         return fingerprint.classify(device)
 
