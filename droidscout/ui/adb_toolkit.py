@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                                QSpinBox, QTabWidget, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from .. import adb_actions, exporter, favorites, i18n, journal
+from .. import adb_actions, exporter, favorites, hw_info, i18n, journal
 from .journal_dialog import JournalDialog
 from .sort_items import NaturalTreeItem
 from .theme import is_dark_theme
@@ -39,6 +39,77 @@ APPS_COLUMNS = ("pkg", "version", "path")
 _PROTO_ERR_RE = re.compile(r"corrupted|closed by device|handshake|unexpected packet", re.I)
 
 VT_URL = "https://www.virustotal.com/gui/search/"
+
+
+# ------------------------------------------------------------- формат железа
+def _hw_freq(khz) -> str:
+    """Частота в кГц -> «1512 МГц» / «1.51 ГГц» (единицы из i18n)."""
+    if not khz:
+        return ""
+    mhz = khz / 1000.0
+    if mhz >= 1000:
+        text = f"{mhz / 1000:.2f}".rstrip("0").rstrip(".")
+        return i18n.tr("hw_ghz_fmt", v=text)
+    return i18n.tr("hw_mhz_fmt", v=int(mhz))
+
+
+def _hw_size(mb) -> str:
+    """МБ -> «7.4 ГБ» / «512 МБ»."""
+    if mb is None or mb <= 0:
+        return ""
+    if mb >= 1024:
+        return i18n.tr("hw_gb_fmt", v=f"{mb / 1024:.1f}")
+    return i18n.tr("hw_mb_fmt", v=mb)
+
+
+def _hw_arch_label(arch: str) -> str:
+    """uname -m -> расшифровка (aarch64 — ARMv8-A, 64 бита)."""
+    key = {"aarch64": "hw_arch_aarch64", "armv7l": "hw_arch_armv7l",
+           "armv8l": "hw_arch_armv8l", "x86_64": "hw_arch_x86_64",
+           "x86": "hw_arch_x86", "i686": "hw_arch_x86",
+           "i386": "hw_arch_x86"}.get((arch or "").lower())
+    return i18n.tr(key) if key else (arch or "")
+
+
+def _hw_abi_label(abi: str) -> str:
+    """ro.product.cpu.abi -> расшифровка разрядности."""
+    key = {"arm64-v8a": "hw_abi_arm64_v8a",
+           "armeabi-v7a": "hw_abi_armeabi_v7a",
+           "x86_64": "hw_abi_x86_64", "x86": "hw_abi_x86"}.get(abi or "")
+    return i18n.tr(key) if key else (abi or "")
+
+
+_TZ_KEYS = (("cpu", "hw_tz_cpu"), ("gpu", "hw_tz_gpu"),
+            ("ddr", "hw_tz_ddr"), ("video", "hw_tz_ve"),
+            ("soc", "hw_tz_soc"), ("board", "hw_tz_board"),
+            ("battery", "hw_tz_battery"), ("charger", "hw_tz_charger"),
+            ("wifi", "hw_tz_wifi"), ("modem", "hw_tz_modem"),
+            ("npu", "hw_tz_npu"), ("usbc", "hw_tz_usbc"),
+            ("skin", "hw_tz_skin"))
+
+
+def _hw_tz_label(ztype: str) -> str:
+    """Тип термозоны (cpu_thermal) -> подпись («Процессор»)."""
+    low = (ztype or "").lower()
+    for token, key in _TZ_KEYS:
+        if token in low:
+            return i18n.tr(key)
+    return ztype or ""
+
+
+_IF_KEYS = (("wlan", "hw_if_wlan"), ("eth", "hw_if_eth"),
+            ("p2p", "hw_if_p2p"), ("rmnet", "hw_if_rmnet"),
+            ("tun", "hw_if_tun"), ("dummy", "hw_if_dummy"),
+            ("ap", "hw_if_ap"), ("lo", "hw_if_lo"))
+
+
+def _hw_if_label(iface: str) -> str:
+    """Имя интерфейса (eth0) -> подпись («Ethernet»); иначе ''."""
+    low = (iface or "").lower()
+    for token, key in _IF_KEYS:
+        if token in low:
+            return i18n.tr(key)
+    return ""
 
 
 def _local_sha256(path: str) -> str:
@@ -142,6 +213,7 @@ class AdbToolkitDialog(QDialog):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._tab_info(), i18n.tr("tab_adb_info"))
+        self.tabs.addTab(self._tab_hw(), i18n.tr("tab_adb_hw"))
         self._settings_page = self._tab_settings()
         self.tabs.addTab(self._settings_page, i18n.tr("tab_adb_settings"))
         self.tabs.currentChanged.connect(self._maybe_load_settings)
@@ -165,9 +237,10 @@ class AdbToolkitDialog(QDialog):
         bottom.addWidget(close_btn)
         root.addLayout(bottom)
 
-        # при открытии: live-проверка root/secure + статистика
+        # при открытии: live-проверка root/secure + статистика + железо
         self._run(self._on_root_info, adb_actions.check_root, self.ip)
         self.refresh_stats()
+        self.refresh_hw()
 
     # ------------------------------------------------------------ инфраструктура
     def _run(self, callback, fn, *args, **kwargs):
@@ -312,6 +385,371 @@ class AdbToolkitDialog(QDialog):
         outer_lay.setContentsMargins(0, 0, 0, 0)
         outer_lay.addWidget(scroll)
         return outer
+
+    # ------------------------------------------------------------ таб: Железо
+    def _tab_hw(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        sum_box = QGroupBox(i18n.tr("hw_summary_box"))
+        sum_lay = QVBoxLayout(sum_box)
+        self.hw_summary = QLabel("—")
+        self.hw_summary.setWordWrap(True)
+        self.hw_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        sum_lay.addWidget(self.hw_summary)
+        layout.addWidget(sum_box)
+
+        self.hw_tree = QTreeWidget()
+        self.hw_tree.setColumnCount(2)
+        self.hw_tree.setHeaderLabels([i18n.tr("hw_col_param"),
+                                      i18n.tr("hw_col_value")])
+        self.hw_tree.setColumnWidth(0, 250)
+        self.hw_tree.setUniformRowHeights(True)
+        layout.addWidget(self.hw_tree, 1)
+
+        btn_row = QHBoxLayout()
+        refresh_btn = QPushButton(i18n.tr("stat_refresh"))
+        refresh_btn.clicked.connect(self.refresh_hw)
+        btn_row.addWidget(refresh_btn)
+        copy_btn = QPushButton(i18n.tr("hw_copy"))
+        copy_btn.clicked.connect(self._hw_copy)
+        btn_row.addWidget(copy_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+        return page
+
+    def refresh_hw(self):
+        self._busy("hw_busy")
+        self._run(self._on_hw, hw_info.read_hw, self.ip)
+
+    def _on_hw(self, hw, exc):
+        if exc:
+            self._failed(exc)
+            self.hw_summary.setText("—")
+            return
+        self._idle()
+        self._hw_fill(hw or {})
+
+    def _hw_copy(self):
+        lines = []
+        for i in range(self.hw_tree.topLevelItemCount()):
+            head = self.hw_tree.topLevelItem(i)
+            lines.append(head.text(0))
+            for j in range(head.childCount()):
+                child = head.child(j)
+                param, value = child.text(0), child.text(1)
+                lines.append(f"  {param}: {value}" if param
+                             else f"  {value}")
+        QApplication.clipboard().setText("\n".join(lines))
+        self.status.setText(i18n.tr("copied"))
+
+    # -- сборка секций вкладки «Железо» -------------------------------------
+    @staticmethod
+    def _hw_section(tree, title, rows):
+        """Секция-родитель с жирным заголовком. Строка показывается, если
+        задан хотя бы один из столбцов — так секции с частичными данными
+        не теряют подписи."""
+        head = QTreeWidgetItem([title, ""])
+        font = head.font(0)
+        font.setBold(True)
+        head.setFont(0, font)
+        tree.addTopLevelItem(head)
+        for param, value in rows:
+            if not param and not value:
+                continue
+            head.addChild(QTreeWidgetItem([param or "", value or ""]))
+        head.setExpanded(True)
+
+    @staticmethod
+    def _hw_gov_text(governor: str) -> str:
+        desc_key = f"hw_gov_{governor}"
+        desc = i18n.tr(desc_key)
+        return f"{governor} — {desc}" if desc != desc_key else governor
+
+    @staticmethod
+    def _hw_cores_text(cpuinfo: dict) -> str:
+        parts = []
+        for impl, part, count in cpuinfo.get("cores_detail") or []:
+            decoded = hw_info.decode_arm_core(impl, part)
+            name = decoded[1] if decoded else i18n.tr(
+                "hw_unknown_core", impl=impl, part=part)
+            parts.append(i18n.tr("hw_cores_fmt", n=count, name=name))
+        if parts:
+            return ", ".join(parts)
+        if cpuinfo.get("model_name"):
+            return cpuinfo["model_name"]
+        if cpuinfo.get("cores"):
+            return i18n.tr("hw_cores_fmt", n=cpuinfo["cores"],
+                           name=i18n.tr("hw_unknown"))
+        return ""
+
+    @staticmethod
+    def _hw_freq_text(cpufreq: list) -> str:
+        mins = [e["min_khz"] for e in cpufreq if e.get("min_khz")]
+        maxs = [e["max_khz"] for e in cpufreq if e.get("max_khz")]
+        curs = [e["cur_khz"] for e in cpufreq if e.get("cur_khz")]
+        if not maxs:
+            return ""
+        text = f"{_hw_freq(min(mins))} – {_hw_freq(max(maxs))}" \
+            if mins else _hw_freq(max(maxs))
+        if curs:
+            text += f" ({i18n.tr('hw_cur_fmt', v=_hw_freq(max(curs)))})"
+        return text
+
+    @staticmethod
+    def _hw_gpu_text(gpu: dict) -> str:
+        renderer = gpu.get("renderer", "")
+        family = gpu.get("family", "")
+        if not renderer:
+            return ""
+        if family == "software-render":
+            return i18n.tr("hw_gpu_software")
+        if family and " (" in family:
+            arch = family.split(" (", 1)[1].rstrip(")")
+            return f"{renderer} — {arch}"
+        if family:
+            return f"{renderer} — {family}"
+        return renderer
+
+    def _hw_fill(self, hw: dict):
+        props = hw.get("props") or {}
+        cpuinfo = hw.get("cpuinfo") or {}
+        cpufreq = hw.get("cpufreq") or []
+        gpu = hw.get("gpu") or {}
+        mem = hw.get("memory") or {}
+        kernel = hw.get("kernel") or {}
+        soc_list = hw.get("soc") or []
+
+        soc_txt = ""
+        if soc_list:
+            first = soc_list[0]
+            soc_txt = f"{first['vendor']} {first['model']}".strip()
+        cores_txt = self._hw_cores_text(cpuinfo)
+        freq_txt = self._hw_freq_text(cpufreq)
+        gpu_txt = self._hw_gpu_text(gpu)
+        ram_txt = _hw_size(mem.get("total_mb"))
+        blocks = hw.get("block") or []
+        storage_txt = ""
+        if blocks and blocks[0].get("size_gb"):
+            storage_txt = _hw_size(int(round(blocks[0]["size_gb"] * 1024)))
+
+        self.hw_summary.setText(i18n.tr(
+            "hw_summary_fmt",
+            soc=soc_txt or i18n.tr("hw_unknown"),
+            cores=cores_txt or "—", freq=freq_txt or "—",
+            gpu=gpu_txt or "—", ram=ram_txt or "—",
+            storage=storage_txt or "—"))
+
+        tree = self.hw_tree
+        tree.clear()
+
+        # --- Процессор (SoC и ядра) -----------------------------------------
+        rows = [(i18n.tr("hw_soc"),
+                 soc_txt or i18n.tr("hw_soc_undetected")),
+                (i18n.tr("hw_cores"), cores_txt),
+                (i18n.tr("hw_freq"), freq_txt)]
+        groups = {}
+        for entry in cpufreq:
+            key = (entry.get("min_khz"), entry.get("max_khz"),
+                   entry.get("governor"))
+            groups.setdefault(key, []).append(entry["core"])
+        for (mn, mx, gov), cores in groups.items():
+            lo, hi = min(cores), max(cores)
+            label = f"cpu{lo}" if lo == hi else f"cpu{lo}–cpu{hi}"
+            value = f"{_hw_freq(mn)} – {_hw_freq(mx)}" if mn \
+                else _hw_freq(mx)
+            if gov:
+                value += f" · {self._hw_gov_text(gov)}"
+            rows.append((label, value))
+        govs = hw.get("governors_available") or []
+        if not groups and cpufreq and cpufreq[0].get("governor"):
+            rows.append((i18n.tr("hw_governor"),
+                         self._hw_gov_text(cpufreq[0]["governor"])))
+        if govs:
+            rows.append((i18n.tr("hw_govs_avail"), ", ".join(govs)))
+        feats = cpuinfo.get("features") or []
+        tokens = set(feats)
+        rows += [
+            (i18n.tr("hw_arch"), _hw_arch_label(kernel.get("arch"))),
+            (i18n.tr("hw_arch_abi"),
+             _hw_abi_label(props.get("ro.product.cpu.abi", ""))),
+            (i18n.tr("hw_model_name"), cpuinfo.get("model_name", "")),
+            (i18n.tr("hw_hw"), cpuinfo.get("hardware", "")),
+        ]
+        if feats:
+            shown = " ".join(feats[:14])
+            if len(feats) > 14:
+                shown += " …"
+            rows.append((i18n.tr("hw_cpu_feat"), shown))
+        rows += [
+            (i18n.tr("hw_neon"),
+             i18n.tr("hw_yes") if {"asimd", "neon"} & tokens
+             else i18n.tr("hw_no")),
+            (i18n.tr("hw_aes"),
+             i18n.tr("hw_yes") if "aes" in tokens else i18n.tr("hw_no")),
+            (i18n.tr("hw_sha"),
+             i18n.tr("hw_yes") if {"sha1", "sha2"} & tokens
+             else i18n.tr("hw_no")),
+        ]
+        if cpuinfo.get("bogo") is not None:
+            rows.append((i18n.tr("hw_bogo"), f"{cpuinfo['bogo']:.2f}"))
+        self._hw_section(tree, i18n.tr("hw_sec_cpu"), rows)
+
+        # --- Графика (GPU) ----------------------------------------------------
+        gpu_rows = [
+            (i18n.tr("hw_gpu"), gpu_txt),
+            (i18n.tr("hw_gles_vendor"), gpu.get("vendor", "")),
+            (i18n.tr("hw_gles_version"), gpu.get("version", "")),
+            (i18n.tr("hw_egl"), props.get("ro.hardware.egl", "")),
+        ]
+        if not gpu:
+            gpu_rows.append(("", i18n.tr("hw_gpu_undetected")))
+        self._hw_section(tree, i18n.tr("hw_sec_gpu"), gpu_rows)
+
+        # --- Оперативная память --------------------------------------------------
+        used_pct = mem.get("used_pct")
+        swap = ""
+        if mem.get("swap_total_mb"):
+            free_txt = _hw_size(mem.get("swap_free_mb"))
+            swap = f"{_hw_size(mem['swap_total_mb'])} " \
+                   f"({i18n.tr('hw_swap_free_fmt', v=free_txt)})"
+        ram_rows = [
+            (i18n.tr("hw_ram_total"), _hw_size(mem.get("total_mb"))),
+            (i18n.tr("hw_ram_avail"), _hw_size(mem.get("available_mb"))),
+            (i18n.tr("hw_ram_cached"), _hw_size(mem.get("cached_mb"))),
+            (i18n.tr("hw_ram_used"),
+             i18n.tr("hw_pct_fmt", v=used_pct)
+             if used_pct is not None else ""),
+            (i18n.tr("hw_ram_swap"), swap),
+            ("", i18n.tr("hw_ram_note") if mem.get("total_mb") else ""),
+        ]
+        self._hw_section(tree, i18n.tr("hw_sec_ram"), ram_rows)
+
+        # --- Накопители ------------------------------------------------------------
+        partitions = hw.get("partitions") or []
+        st_rows = []
+        for blk in blocks:
+            chip = f" — {blk['chip']}" if blk.get("chip") else ""
+            st_rows.append((i18n.tr("hw_disk_chip"), f"{blk['name']}{chip}"))
+            if blk.get("size_gb"):
+                st_rows.append((i18n.tr("hw_disk_size"),
+                                _hw_size(int(round(blk["size_gb"] * 1024)))))
+        if partitions:
+            st_rows.append((i18n.tr("hw_parts_count"),
+                            str(len(partitions))))
+            top = [f"{p['name']} {_hw_size(p['mb'])}"
+                   for p in sorted(partitions, key=lambda x: -x["mb"])[:4]]
+            st_rows.append((i18n.tr("hw_parts_top"), " · ".join(top)))
+        for item in (hw.get("storage") or [])[:8]:
+            st_rows.append((item["mount"],
+                            f"{_hw_size(item['total_mb'])}, "
+                            f"{i18n.tr('hw_pct_fmt', v=item['used_pct'])}"))
+        self._hw_section(tree, i18n.tr("hw_sec_storage"), st_rows)
+
+        # --- Дисплей -----------------------------------------------------------------
+        disp = hw.get("display") or {}
+        size = disp.get("size", "")
+        if disp.get("override_size"):
+            size = f"{size} → {disp['override_size']}"
+        density = disp.get("density", "")
+        if disp.get("override_density"):
+            density = f"{density} → {disp['override_density']}"
+        fps = disp.get("fps")
+        self._hw_section(tree, i18n.tr("hw_sec_display"), [
+            (i18n.tr("hw_disp_res"), size),
+            (i18n.tr("hw_disp_dens"),
+             f"{density} dpi" if density else ""),
+            (i18n.tr("hw_disp_fps"),
+             i18n.tr("hw_fps_fmt", v=fps) if fps else ""),
+        ])
+
+        # --- Батарея --------------------------------------------------------------------
+        batt = hw.get("battery") or {}
+        batt_rows = []
+        if batt.get("level") is not None:
+            batt_rows.append((i18n.tr("hw_batt_level"),
+                              i18n.tr("hw_pct_fmt", v=batt["level"])))
+        for key, label in (("status", "hw_batt_status"),
+                           ("health", "hw_batt_health")):
+            value = batt.get(key)
+            if value:
+                batt_rows.append((i18n.tr(label),
+                                  i18n.tr(f"{label}_{value}")))
+        if batt.get("technology"):
+            batt_rows.append((i18n.tr("hw_batt_tech"), batt["technology"]))
+        if batt.get("voltage_mv"):
+            batt_rows.append((i18n.tr("hw_batt_voltage"),
+                              i18n.tr("hw_mv_fmt", v=batt["voltage_mv"])))
+        if batt.get("temp_c") is not None:
+            batt_rows.append((i18n.tr("hw_batt_temp"),
+                              i18n.tr("hw_temp_fmt", v=batt["temp_c"])))
+        if not batt_rows:
+            batt_rows.append(("", i18n.tr("hw_batt_absent")))
+        self._hw_section(tree, i18n.tr("hw_sec_battery"), batt_rows)
+
+        # --- Датчики температуры ------------------------------------------------------------
+        tz_rows = []
+        for zone in hw.get("thermal") or []:
+            label = _hw_tz_label(zone.get("type", ""))
+            tz_rows.append((label or zone.get("type", ""),
+                            i18n.tr("hw_temp_fmt", v=zone["temp_c"])))
+        self._hw_section(tree, i18n.tr("hw_sec_thermal"), tz_rows)
+
+        # --- Сеть -------------------------------------------------------------------------------
+        net_rows = []
+        for iface in hw.get("net") or []:
+            label = _hw_if_label(iface["iface"])
+            name = f"{iface['iface']} — {label}" if label else iface["iface"]
+            value = ", ".join(iface["ips"]) if iface.get("ips") \
+                else i18n.tr("hw_no_ip")
+            if iface.get("mac"):
+                value += f" · {iface['mac']}"
+            net_rows.append((name, value))
+        self._hw_section(tree, i18n.tr("hw_sec_net"), net_rows)
+
+        # --- Ядро и система -----------------------------------------------------------------------
+        days, rest = divmod(int(hw.get("uptime_sec") or 0), 86400)
+        hours, minutes = divmod(rest // 60, 60)
+        self._hw_section(tree, i18n.tr("hw_sec_kernel"), [
+            (i18n.tr("hw_kernel_ver"), kernel.get("version", "")),
+            (i18n.tr("hw_kernel_raw"),
+             (kernel.get("raw", "") or "")[:160]),
+            (i18n.tr("hw_kernel_arch"),
+             _hw_arch_label(kernel.get("arch")) or kernel.get("arch", "")),
+            (i18n.tr("hw_uptime"), i18n.tr("stat_uptime_fmt", days=days,
+                                            hours=hours, minutes=minutes)),
+        ])
+
+        # --- Платформа -------------------------------------------------------------------------------
+        dt = hw.get("dt") or {}
+        plat_rows = [(i18n.tr("hw_dt_model"), dt.get("model", ""))]
+        for comp in (dt.get("compatible") or [])[:6]:
+            plat_rows.append((i18n.tr("hw_dt_compat"), comp))
+        for item in soc_list[:4]:
+            plat_rows.append((i18n.tr("hw_soc_sources"), i18n.tr(
+                "hw_sources_fmt",
+                model=f"{item['vendor']} {item['model']}".strip(),
+                source=item["source"])))
+        if hw.get("platform"):
+            plat_rows.append((i18n.tr("hw_platform_sys"),
+                              ", ".join(hw["platform"][:10])))
+        self._hw_section(tree, i18n.tr("hw_sec_platform"), plat_rows)
+
+        # --- Аппаратные возможности ---------------------------------------------------------------------
+        features = hw.get("features") or []
+        if features:
+            key_feats = [f for f in features
+                         if any(t in f for t in ("wifi", "bluetooth",
+                                                 "ethernet", "camera",
+                                                 "location", "nfc",
+                                                 "microphone", "usb",
+                                                 "leanback", "live_tv"))]
+            self._hw_section(tree, i18n.tr("hw_sec_features"), [
+                (i18n.tr("hw_feat_count_fmt", n=len(features)), ""),
+                (i18n.tr("hw_feat_keys"),
+                 ", ".join(key_feats) if key_feats else ""),
+                ("", "\n".join(features)),
+            ])
 
     # ------------------------------------------------------------ таб: Настройки
     def _tab_settings(self):
