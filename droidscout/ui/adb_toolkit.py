@@ -12,15 +12,17 @@ import datetime
 import hashlib
 import os
 import re
+import threading
 
-from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QImage, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                                QFileDialog, QFormLayout, QFrame, QGridLayout,
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                               QMessageBox, QPlainTextEdit, QPushButton,
-                               QScrollArea, QSpinBox, QTabWidget, QTreeWidget,
-                               QTreeWidgetItem, QVBoxLayout, QWidget)
+                               QMessageBox, QPlainTextEdit, QProgressDialog,
+                               QPushButton, QScrollArea, QSpinBox, QTabWidget,
+                               QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+                               QWidget)
 
 from .. import adb_actions, exporter, i18n, journal
 from .journal_dialog import JournalDialog
@@ -50,11 +52,20 @@ def _local_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _human_mb(num_bytes: int) -> str:
+    """48 019 632 -> «45,8 МБ» (меньше мегабайта — в КБ)."""
+    if num_bytes < 1024 * 1024:
+        return ("%.0f КБ" % (num_bytes / 1024)).replace(".", ",")
+    return ("%.1f МБ" % (num_bytes / 1048576)).replace(".", ",")
+
+
 def _friendly_error(exc: Exception, ip: str) -> str:
     """ActionError -> понятный локализованный текст."""
     if isinstance(exc, adb_actions.ActionError):
         if exc.code == "unauthorized":
             return i18n.tr("adb_unauthorized")
+        if exc.code == "cancel":
+            return i18n.tr("err_cancelled")
         if exc.code == "conn":
             key = "adb_conn_protocol" if _PROTO_ERR_RE.search(str(exc)) else "adb_conn"
             return i18n.tr(key, ip=ip, port=5555, error=str(exc)[:150])
@@ -80,6 +91,16 @@ class ActionWorker(QThread):
             self.result.emit(self._fn(), None)
         except Exception as exc:  # noqa: BLE001 — показываем в UI
             self.result.emit(None, exc)
+
+
+class ProgressBridge(QObject):
+    """Прогресс из Worker-потока в UI: сигнал вместо прямого вызова.
+
+    Колбэк push'а дёргается из QThread — трогать виджеты оттуда нельзя;
+    эмитим Signal(int, int), Qt сам маршалит вызов в GUI-поток.
+    """
+
+    tick = Signal(int, int)
 
 
 class AdbToolkitDialog(QDialog):
@@ -147,6 +168,59 @@ class AdbToolkitDialog(QDialog):
         self._workers.append(worker)
         worker.start()
         return worker
+
+    def _run_with_progress(self, title_key, transfer_key, callback, fn,
+                           *args, finish_busy=False, **kwargs):
+        """Запускает fn в фоне с диалогом прогресса передачи.
+
+        progress(s, t): s<t — процент передачи; s==t — передача окончена:
+        при finish_busy диалог переключается в «занят» (идёт pm install),
+        иначе закрывается. Кнопка «Отмена» останавливает передачу между
+        чанками (should_stop), ошибка/отмена покажутся как обычно.
+        """
+        bridge = ProgressBridge()
+        self._progress_bridge = bridge       # держим ссылку до конца работы
+        self._cancel_event = threading.Event()
+        dlg = QProgressDialog("", i18n.tr("cancel_btn"), 0, 100, self)
+        dlg.setWindowTitle(i18n.tr(title_key))
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setMinimumWidth(380)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.canceled.connect(self._cancel_event.set)
+        self._progress_dlg = dlg
+        self._progress_state = {"transfer_key": transfer_key,
+                                "finish_busy": finish_busy}
+        bridge.tick.connect(self._on_transfer_tick)
+        dlg.show()
+        kwargs.setdefault("progress", lambda s, t: bridge.tick.emit(s, t))
+        kwargs.setdefault("should_stop", self._cancel_event.is_set)
+        self._run(callback, fn, *args, **kwargs)
+
+    def _on_transfer_tick(self, sent, total):
+        dlg = self._progress_dlg
+        if dlg is None:
+            return
+        state = self._progress_state or {}
+        if sent >= total:
+            if state.get("finish_busy"):
+                dlg.setRange(0, 0)           # «занят»: идёт pm install
+                dlg.setLabelText(i18n.tr("progress_installing"))
+            else:
+                dlg.close()
+            return
+        dlg.setLabelText(i18n.tr(state.get("transfer_key", ""),
+                                 sent=_human_mb(sent),
+                                 total=_human_mb(total)))
+        dlg.setValue(int(sent * 100 / max(total, 1)))
+
+    def _close_progress(self):
+        dlg = getattr(self, "_progress_dlg", None)
+        if dlg is not None:
+            dlg.close()
+            self._progress_dlg = None
+        self._progress_state = None
 
     def _open_journal(self):
         JournalDialog(self).show()
@@ -989,11 +1063,15 @@ class AdbToolkitDialog(QDialog):
             return
         self.install_btn.setEnabled(False)
         self._busy("apps_installing")
-        self._run(lambda out, exc: self._on_install(out, exc),
-                  adb_actions.install_apk, self.ip, path)
+        self._run_with_progress(
+            "apps_installing", "progress_transfer_fmt",
+            lambda out, exc: self._on_install(out, exc),
+            adb_actions.install_apk, self.ip, path,
+            finish_busy=True)
 
     def _on_install(self, output, exc):
         self.install_btn.setEnabled(True)
+        self._close_progress()
         if exc:
             self._failed(exc)
             return
@@ -1284,12 +1362,15 @@ class AdbToolkitDialog(QDialog):
             return
         self.files_upload_btn.setEnabled(False)
         self._busy("files_uploading")
-        self._run(lambda remote, exc: self._on_file_uploaded(remote, exc),
-                  adb_actions.push_file, self.ip, path,
-                  self.files_path.text().strip() or "/")
+        self._run_with_progress(
+            "files_uploading", "upload_transfer_fmt",
+            lambda remote, exc: self._on_file_uploaded(remote, exc),
+            adb_actions.push_file, self.ip, path,
+            self.files_path.text().strip() or "/")
 
     def _on_file_uploaded(self, remote, exc):
         self.files_upload_btn.setEnabled(True)
+        self._close_progress()
         if exc:
             self._failed(exc)
             return

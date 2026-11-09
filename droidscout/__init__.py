@@ -1,5 +1,5 @@
 """DroidScout — сетевой сканер Android-устройств с GUI."""
 
-__version__ = "1.6.8"
+__version__ = "1.6.9"
 APP_NAME = "DroidScout"
 APP_URL = "https://github.com/OWNER/droidscout"

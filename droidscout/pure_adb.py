@@ -21,6 +21,7 @@ import math
 import os
 import re
 import secrets
+import select
 import socket
 import struct
 import threading
@@ -517,11 +518,20 @@ class AdbDevice:
         return base64.b64decode(re.sub(r"\s+", "", text)) if text.strip() else b""
 
     def push_bytes(self, data: bytes, remote_path: str,
-                   timeout: "float | None" = None) -> None:
+                   timeout: "float | None" = None,
+                   progress: "Callable[[int, int], None] | None" = None,
+                   should_stop: "Callable[[], bool] | None" = None) -> None:
         """Кладёт файл на устройство через сервис 'sync:' (SEND/DATA/DONE).
 
         Соединение не закрывается — можно продолжить работу (например,
         вызвать shell("pm install …") сразу после передачи APK).
+
+        progress(отправлено_байт, всего_байт) вызывается после каждого
+        чанка — для диалога прогресса в UI. should_stop() проверяется
+        между чанками: True -> AdbError('push cancelled') — так работает
+        кнопка «Отмена». Подтверждения OKAY дочитываются в процессе
+        передачи (_drain_sync): без этого на файлах в сотни мегабайт
+        TCP-буферы переполняются и передача замирает навсегда.
         """
         if not self.sock:
             raise AdbError("not connected")
@@ -568,8 +578,18 @@ class AdbDevice:
         # после DONE; промежуточные socket-ACK (A_OKAY) дочитываются в конце.
         sync(b"SEND", remote_path.encode("utf-8") + b",0644")
         chunk_size = max(1024, min(self.max_payload, 32 * 1024))
-        for offset in range(0, len(data), chunk_size):
-            sync(b"DATA", data[offset:offset + chunk_size])
+        total = len(data)
+        for offset in range(0, total, chunk_size):
+            if should_stop is not None and should_stop():
+                raise AdbError("push cancelled")
+            chunk = data[offset:offset + chunk_size]
+            sync(b"DATA", chunk)
+            if progress is not None:
+                try:
+                    progress(offset + len(chunk), total)
+                except Exception:  # noqa: BLE001 — прогресс не роняет передачу
+                    pass
+            self._drain_sync(local_id, remaining)
         sync(b"DONE", struct.pack("<I", int(time.time())))
         answer = sync_ack()
         if answer[:4] == b"FAIL":
@@ -581,6 +601,28 @@ class AdbDevice:
             sync_ack()
         except (AdbError, AdbTimeout):
             pass  # устройство уже закрыло поток — не критично
+
+    def _drain_sync(self, local_id: int, remaining) -> None:
+        """Забирает готовые OKAY-подтверждения adbd во время передачи.
+
+        adbd шлёт OKAY на каждый WRTE. Если клиент не читает их в процессе
+        отправки, на больших файлах приёмный TCP-буфер заполняется:
+        adbd блокируется на отправке очередного OKAY, перестаёт принимать
+        DATA — передача замирает навсегда (классический sync-deadlock).
+        Здесь неблокирующе (select) забираем то, что уже пришло; полный
+        разбор хвоста делает sync_ack после DONE.
+        """
+        if not self.sock:
+            return
+        readable, _, _ = select.select([self.sock], [], [], 0)
+        if not readable:
+            return
+        message = self._recv(remaining())
+        if message.cmd == A_CLSE and message.arg1 == local_id:
+            raise AdbError("sync stream closed unexpectedly")
+        if message.cmd == A_WRTE and message.arg1 == local_id:
+            self._send(A_OKAY, local_id, message.arg0)
+        # A_OKAY (и прочее) — учтено, продолжаем отправку
 
     # ------------------------------------------------------------- транспорт
     def _send(self, cmd: int, arg0: int, arg1: int, data: bytes = b""):

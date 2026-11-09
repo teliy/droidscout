@@ -574,8 +574,17 @@ def app_action(host: str, package: str, action: str, port: int = 5555,
 
 
 def install_apk(host: str, apk_path: str, port: int = 5555,
-                timeout: float = 180.0) -> str:
-    """Локальный APK -> устройство (sync push) -> 'pm install -r'."""
+                timeout: float = 300.0,
+                progress: "Callable[[int, int], None] | None" = None,
+                should_stop: "Callable[[], bool] | None" = None) -> str:
+    """Локальный APK -> устройство (sync push) -> 'pm install -r'.
+
+    progress(байт, всего) — прогресс передачи; после последнего чанка
+    callback получает (len(data), len(data)) — сигнал «передача окончена»
+    (в UI это переключение на этап pm install). should_stop() — проверка
+    отмены: до старта и между чанками; отменённая операция ->
+    ActionError с кодом 'cancel'.
+    """
     try:
         with open(apk_path, "rb") as f:
             data = f.read()
@@ -583,27 +592,39 @@ def install_apk(host: str, apk_path: str, port: int = 5555,
         raise ActionError(str(exc), "") from exc
     if not data:
         raise ActionError("empty apk", "")
+    if should_stop is not None and should_stop():
+        raise ActionError("cancelled", "cancel")
     device = _open(host, port, max(timeout, 30.0))
     try:
         journal.event(f"{host}:{port}", f"push APK: {len(data)} B -> {APK_PATH}")
-        device.push_bytes(data, APK_PATH, timeout=timeout)
+        device.push_bytes(data, APK_PATH, timeout=timeout,
+                          progress=progress, should_stop=should_stop)
+        journal.event(f"{host}:{port}", "push ok — запускаю pm install")
+        if should_stop is not None and should_stop():
+            raise ActionError("cancelled", "cancel")
         output = device.shell(f"pm install -r {APK_PATH} && rm -f {APK_PATH}",
                               timeout=timeout)
+        journal.event(f"{host}:{port}",
+                      f"pm install: {(output or '').strip()[:120] or 'ok'}")
         return output.strip()
     except (AdbError, AdbTimeout, OSError) as exc:
-        raise ActionError(str(exc), "conn") from exc
+        code = "cancel" if "cancel" in str(exc).lower() else "conn"
+        raise ActionError(str(exc), code) from exc
     finally:
         device.close()
 
 
 # ---------------------------------------------------------------- файлы
 def push_file(host: str, local_path: str, remote_dir: str,
-              port: int = 5555, timeout: float = 180.0) -> str:
+              port: int = 5555, timeout: float = 300.0,
+              progress: "Callable[[int, int], None] | None" = None,
+              should_stop: "Callable[[], bool] | None" = None) -> str:
     """Локальный файл с ПК -> устройство (sync SEND). Возвращает удалённый путь.
 
     Имя файла сохраняется: /sdcard + 'photo.jpg' -> '/sdcard/photo.jpg'.
     Копирование идёт с правами 0644 — для /system нужен root-remount,
-    штатные цели — /sdcard и /data/local/tmp.
+    штатные цели — /sdcard и /data/local/tmp. progress/should_stop —
+    прогресс и отмена (см. install_apk).
     """
     name = os.path.basename((local_path or "").replace("\\", "/")).strip()
     if not name:
@@ -620,10 +641,12 @@ def push_file(host: str, local_path: str, remote_dir: str,
     device = _open(host, port, max(timeout, 30.0))
     try:
         journal.event(f"{host}:{port}", f"push {len(data)} B -> {remote}")
-        device.push_bytes(data, remote, timeout=timeout)
+        device.push_bytes(data, remote, timeout=timeout,
+                          progress=progress, should_stop=should_stop)
     except (AdbError, AdbTimeout, OSError) as exc:
+        code = "cancel" if "cancel" in str(exc).lower() else "conn"
         journal.error(f"{host}:{port}", "push", exc)
-        raise ActionError(str(exc), "conn") from exc
+        raise ActionError(str(exc), code) from exc
     finally:
         device.close()
     journal.event(f"{host}:{port}", f"push ok: {remote} ({len(data)} B)")
