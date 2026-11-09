@@ -431,8 +431,10 @@ class ScanEngine(QThread):
             return
 
         # Проверяем, работает ли ICMP (нет прав/брандмауэр) — тогда зондируем
-        # все адреса напрямую по TCP.
-        ping_works = _ping("127.0.0.1", min(1000, self.host_timeout_ms))
+        # все адреса напрямую по TCP. _ping возвращает кортеж (ok, ttl) —
+        # нельзя класть его в условие целиком: непустой кортеж всегда truthy.
+        ping_ok, _self_ttl = _ping("127.0.0.1", min(1000, self.host_timeout_ms))
+        ping_works = ping_ok
 
         # 1. mDNS и SSDP параллельно с пинг-опросом
         if self.deep:

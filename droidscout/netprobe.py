@@ -74,20 +74,44 @@ def ttl_evidence(ttl: int, lang: str = "ru") -> str:
 
 # ------------------------------------------------------ глубокий скан портов
 
-def scan_all_ports(ip: str, port_range: Tuple[int, int] = (1, 65535),
-                   timeout: float = 0.35, workers: int = 600,
-                   progress: "Optional[Callable[[int, int], None]]" = None,
-                   stop: Optional[threading.Event] = None,
-                   deadline_sec: float = 240.0) -> List[int]:
-    """TCP connect-скан полного диапазона портов.
+# Порты «быстрого прохода»: все Well-Known (1–1024) плюс популярные высокие
+# порты роутеров, NAS, IoT, медиа и админ-панелей. Диалог глубокого опроса
+# сначала проходит этот список (секунды) и сразу показывает сервисы, затем
+# сканирует оставшийся диапазон.
+QUICK_EXTRA_PORTS: Tuple[int, ...] = (
+    1080, 1194, 1234, 1723, 1900, 2020, 2049, 2082, 2083, 2086, 2087, 2121,
+    2323, 2375, 2376, 3000, 3001, 3128, 32400, 3260, 3306, 3344, 3389, 3443,
+    36669, 3689, 4040, 4443, 4444, 4712, 4840, 5000, 5001, 5009, 5060, 5061,
+    5222, 5228, 5353, 5432, 5480, 5555, 5556, 5588, 5800, 5900, 5901, 5902,
+    5903, 5911, 5984, 5985, 5986, 6000, 6379, 6443, 6466, 6600, 6667, 6888,
+    7000, 7001, 7002, 7070, 7100, 7443, 7547, 7777, 8000, 8001, 8008, 8009,
+    8010, 8020, 8042, 8060, 8069, 8080, 8081, 8086, 8088, 8090, 8091, 8096,
+    8108, 8118, 8123, 8181, 8200, 8222, 8245, 8281, 8333, 8400, 8443, 8530,
+    8554, 8555, 8765, 8787, 8800, 8834, 8843, 8844, 8899, 8983, 9000, 9001,
+    9010, 9080, 9090, 9091, 9100, 9191, 9200, 9292, 9418, 9443, 9500, 9797,
+    9990, 9999, 10000, 10001, 10050, 10051, 10100, 11311, 12345, 13364,
+    14000, 15000, 16080, 17185, 18080, 18181, 19150, 20000, 24800, 25565,
+    27017, 28017, 31337, 32764, 33060, 38080, 40000, 41952, 44818, 48049,
+    49152, 49153, 49154, 49155, 49156, 50000, 50050,
+)
+QUICK_PORTS: Tuple[int, ...] = tuple(sorted(set(range(1, 1025))
+                                           | set(QUICK_EXTRA_PORTS)))
 
-    Возвращает список открытых портов. progress(done, total) — для прогресса,
-    stop (threading.Event) — прервать. На «молчащих» (firewall) хостах весь
-    диапазон занимает до deadline_sec, на обычной LAN — секунды.
+
+def scan_ports(ip: str, ports, timeout: float = 0.35, workers: int = 800,
+               progress: "Optional[Callable[[int, int], None]]" = None,
+               stop: Optional[threading.Event] = None,
+               deadline_sec: float = 240.0) -> List[int]:
+    """TCP connect-скан произвольного списка портов.
+
+    Возвращает отсортированный список открытых портов. progress(done, total)
+    — для прогресса, stop (threading.Event) — прервать. На «молчащих»
+    (firewall) хостах весь список занимает до deadline_sec, на обычной LAN —
+    секунды.
     """
-    lo, hi = port_range
-    total = hi - lo + 1
-    if total <= 0:
+    port_list = sorted({int(p) for p in ports})
+    total = len(port_list)
+    if not total:
         return []
     opened: List[int] = []
     lock = threading.Lock()
@@ -120,10 +144,21 @@ def scan_all_ports(ip: str, port_range: Tuple[int, int] = (1, 65535),
 
     workers = max(1, min(workers, total))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(sweep, p) for p in range(lo, hi + 1)]
+        futures = [pool.submit(sweep, p) for p in port_list]
         for _fut in as_completed(futures):
             pass
     return sorted(set(opened))
+
+
+def scan_all_ports(ip: str, port_range: Tuple[int, int] = (1, 65535),
+                   timeout: float = 0.35, workers: int = 800,
+                   progress: "Optional[Callable[[int, int], None]]" = None,
+                   stop: Optional[threading.Event] = None,
+                   deadline_sec: float = 240.0) -> List[int]:
+    """TCP connect-скан полного диапазона портов (обёртка над scan_ports)."""
+    lo, hi = port_range
+    return scan_ports(ip, range(lo, hi + 1), timeout=timeout, workers=workers,
+                      progress=progress, stop=stop, deadline_sec=deadline_sec)
 
 
 # --------------------------------------------------- распознавание сервисов
