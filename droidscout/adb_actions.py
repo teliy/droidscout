@@ -486,10 +486,71 @@ def parse_dumpsys_package(text: str) -> dict:
     return out
 
 
+def _app_process_state(host: str, package: str, port: int,
+                       timeout: float) -> "tuple[bool, int, str]":
+    """Работает ли приложение: 'pidof', фолбэк — 'ps | grep'.
+
+    На части прошивок pidof отсутствует (toolbox), а его отсутствие
+    выглядит как пустой вывод — потому проверяем по цепочке.
+    Возвращает (running, pid, via).
+    """
+    try:
+        text = shell(host, f"pidof {shlex_quote(package)}", port, timeout)
+    except ActionError:
+        text = ""
+    pids = re.findall(r"\b(\d+)\b", text or "")
+    if pids:
+        return True, int(pids[0]), "pidof"
+    try:
+        text = shell(host, f"ps | grep -w {shlex_quote(package)}"
+                           " | grep -v grep", port, timeout)
+    except ActionError:
+        text = ""
+    # и toybox, и toolbox кладут PID во вторую колонку
+    pids = re.findall(r"^\s*\S+\s+(\d+)", text or "", re.M)
+    if pids:
+        return True, int(pids[0]), "ps"
+    return False, 0, ""
+
+
+def _apk_sha256_on_device(host: str, path: str, port: int,
+                          timeout: float) -> str:
+    """SHA-256 APK прямо на устройстве ('sha256sum') — без скачивания.
+
+    Каталог (типа /data/app/com.x-XXXX==) дополняем '/base.apk'; нет
+    sha256sum на прошивке — вернём '' (UI покажет «—»).
+    """
+    if not path:
+        return ""
+    candidates = ([path.rstrip("/") + "/base.apk", path]
+                  if not path.lower().endswith(".apk") else [path])
+    for candidate in candidates:
+        try:
+            text = shell(host, f"sha256sum {shlex_quote(candidate)}",
+                         port, timeout)
+        except ActionError:
+            continue
+        match = re.search(r"\b([0-9a-fA-F]{64})\b", text or "")
+        if match:
+            return match.group(1).lower()
+    return ""
+
+
 def app_details(host: str, package: str, port: int = 5555,
-                timeout: float = 15.0) -> dict:
+                timeout: float = 15.0, fallback_path: str = "") -> dict:
+    """Карточка приложения + состояние процесса + SHA-256 APK.
+
+    running/pid — живой процесс (pidof -> ps); sha256 — «sha256sum»
+    прямо на устройстве (без скачивания), годится для проверки пакета
+    на VirusTotal. Ошибки состояния/хэша не роняют карточку.
+    """
     text = shell(host, f"dumpsys package {shlex_quote(package)}", port, timeout)
-    return parse_dumpsys_package(text)
+    out = parse_dumpsys_package(text)
+    running, pid, _via = _app_process_state(host, package, port, timeout)
+    out["running"], out["pid"] = running, pid
+    apk_path = out.get("path") or fallback_path
+    out["sha256"] = _apk_sha256_on_device(host, apk_path, port, timeout)
+    return out
 
 
 APP_ACTIONS = {

@@ -9,15 +9,17 @@
 """
 
 import datetime
+import hashlib
 import os
 import re
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import (QComboBox, QDialog, QFileDialog, QFormLayout,
-                               QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QLineEdit, QMessageBox, QPlainTextEdit,
-                               QPushButton, QSpinBox, QTabWidget, QTreeWidget,
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QImage, QPixmap
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog,
+                               QFileDialog, QFormLayout, QGridLayout,
+                               QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+                               QMessageBox, QPlainTextEdit, QPushButton,
+                               QSpinBox, QTabWidget, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .. import adb_actions, exporter, i18n, journal
@@ -32,6 +34,20 @@ APPS_COLUMNS = ("pkg", "version", "path")
 # Ошибки транспорта на уровне протокола: обычно это кривая/зависшая прошивка,
 # а не выключенный ADB — нужна другая подсказка, чем для "connect: ..."
 _PROTO_ERR_RE = re.compile(r"corrupted|closed by device|handshake|unexpected packet", re.I)
+
+VT_URL = "https://www.virustotal.com/gui/search/"
+
+
+def _local_sha256(path: str) -> str:
+    """SHA-256 файла на ПК (для проверки пакета на VirusTotal)."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
 
 
 def _friendly_error(exc: Exception, ip: str) -> str:
@@ -659,6 +675,20 @@ class AdbToolkitDialog(QDialog):
         saved = saved or [dest]
         self.status.setText(i18n.tr("apps_apk_saved",
                                     count=len(saved), path=saved[0]))
+        sha = _local_sha256(saved[0])
+        if not sha:
+            return
+        QApplication.clipboard().setText(sha)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle(i18n.tr("apps_apk_dl"))
+        box.setText(i18n.tr("apps_sha256_line", count=len(saved),
+                            path=saved[0], sha=sha))
+        vt_btn = box.addButton(i18n.tr("apps_vt_open"), QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Ok)
+        box.exec()
+        if box.clickedButton() is vt_btn:
+            QDesktopServices.openUrl(QUrl(VT_URL + sha))
 
     def _selected_package(self):
         item = self.apps_tree.currentItem()
@@ -714,9 +744,12 @@ class AdbToolkitDialog(QDialog):
         package = self._selected_package()
         if not package:
             return
+        item = self.apps_tree.currentItem()
+        fallback = item.text(3) if item else ""
         self._busy()
         self._run(lambda out, exc: self._on_app_details(package, out, exc),
-                  adb_actions.app_details, self.ip, package)
+                  adb_actions.app_details, self.ip, package,
+                  fallback_path=fallback)
 
     def _on_app_details(self, package, details, exc):
         if exc:
@@ -724,15 +757,30 @@ class AdbToolkitDialog(QDialog):
             return
         self._idle()
         details = details or {}
-        QMessageBox.information(
-            self, i18n.tr("apps_details_title", pkg=package),
-            i18n.tr("apps_details_fmt",
-                    version=details.get("version", "—"),
-                    code=details.get("code", "—"),
-                    installed=details.get("installed", "—"),
-                    updated=details.get("updated", "—"),
-                    sdk=details.get("target_sdk", "—"),
-                    path=details.get("path", "—")))
+        state = i18n.tr("apps_stopped")
+        if details.get("running"):
+            state = i18n.tr("apps_running", pid=details.get("pid") or "?")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle(i18n.tr("apps_details_title", pkg=package))
+        box.setText(i18n.tr(
+            "apps_details_fmt",
+            version=details.get("version", "—"),
+            code=details.get("code", "—"),
+            installed=details.get("installed", "—"),
+            updated=details.get("updated", "—"),
+            sdk=details.get("target_sdk", "—"),
+            path=details.get("path", "—"),
+            state=state,
+            sha256=details.get("sha256") or "—"))
+        vt_btn = None
+        if details.get("sha256"):
+            vt_btn = box.addButton(i18n.tr("apps_vt_open"),
+                                   QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Ok)
+        box.exec()
+        if vt_btn is not None and box.clickedButton() is vt_btn:
+            QDesktopServices.openUrl(QUrl(VT_URL + details["sha256"]))
 
     def _install_apk(self):
         path, _ = QFileDialog.getOpenFileName(
