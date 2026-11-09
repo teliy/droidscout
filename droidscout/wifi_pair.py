@@ -50,7 +50,9 @@ PEER_INFO_SIZE = 8192                # sizeof(PeerInfo): uint8 type + data[8191]
 ADB_RSA_PUB_KEY = 0                  # PeerInfoType
 ADB_DEVICE_GUID = 1
 
-_EXPORT_LABEL = b"adb-label"         # kExportedKeyLabel из tls_connection.cpp
+_EXPORT_LABEL = b"adb-label\x00"     # kExportedKeyLabel; adb передаёт в
+# SSL_export_keying_material размер sizeof(kExportedKeyLabel) — ВМЕСТЕ с NUL,
+# поэтому лейбл в экспортёре TLS 1.3 — 10 байт, а не 9 (иначе ключи не сойдутся)
 _EXPORT_LEN = 64                     # kExportedKeySize
 _HKDF_INFO = b"adb pairing_auth aes-128-gcm key"   # sizeof - 1, без NUL
 
