@@ -72,6 +72,7 @@ class AdbToolkitDialog(QDialog):
         self._shell_index = -1
         self._shot_png = b""
         self._root_info = {}
+        self._dev_loaded = False
 
         self.setWindowTitle(i18n.tr("toolkit_title", ip=self.ip))
         self.resize(760, 600)
@@ -87,6 +88,9 @@ class AdbToolkitDialog(QDialog):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._tab_info(), i18n.tr("tab_adb_info"))
+        self._settings_page = self._tab_settings()
+        self.tabs.addTab(self._settings_page, i18n.tr("tab_adb_settings"))
+        self.tabs.currentChanged.connect(self._maybe_load_settings)
         self.tabs.addTab(self._tab_apps(), i18n.tr("tab_adb_apps"))
         self.tabs.addTab(self._tab_remote(), i18n.tr("tab_adb_remote"))
         self.tabs.addTab(self._tab_screenshot(), i18n.tr("tab_adb_shot"))
@@ -152,6 +156,201 @@ class AdbToolkitDialog(QDialog):
             reboot_row.addWidget(btn)
         form.addRow(reboot_box)
         return page
+
+    # ------------------------------------------------------------ таб: Настройки
+    def _tab_settings(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        dev_box = QGroupBox(i18n.tr("dev_group"))
+        dev_form = QVBoxLayout(dev_box)
+        cur_row = QHBoxLayout()
+        cur_row.addWidget(QLabel(i18n.tr("dev_current")))
+        self.dev_value_label = QLabel("—")
+        self.dev_value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        cur_row.addWidget(self.dev_value_label, 1)
+        dev_form.addLayout(cur_row)
+        hint = QLabel(i18n.tr("dev_hint"))
+        hint.setWordWrap(True)
+        dev_form.addWidget(hint)
+        btn_row = QHBoxLayout()
+        self.dev_enable_btn = QPushButton(i18n.tr("dev_enable"))
+        self.dev_enable_btn.clicked.connect(lambda: self._toggle_dev(True))
+        btn_row.addWidget(self.dev_enable_btn)
+        self.dev_disable_btn = QPushButton(i18n.tr("dev_disable"))
+        self.dev_disable_btn.clicked.connect(lambda: self._toggle_dev(False))
+        btn_row.addWidget(self.dev_disable_btn)
+        self.dev_refresh_btn = QPushButton(i18n.tr("dev_refresh"))
+        self.dev_refresh_btn.clicked.connect(self.refresh_dev_mode)
+        btn_row.addWidget(self.dev_refresh_btn)
+        self.dev_open_btn = QPushButton(i18n.tr("dev_open_menu"))
+        self.dev_open_btn.clicked.connect(self._open_dev_menu)
+        btn_row.addWidget(self.dev_open_btn)
+        btn_row.addStretch(1)
+        dev_form.addLayout(btn_row)
+        layout.addWidget(dev_box)
+
+        set_box = QGroupBox(i18n.tr("set_group"))
+        set_form = QVBoxLayout(set_box)
+        ns_row = QHBoxLayout()
+        ns_row.addWidget(QLabel(i18n.tr("set_ns")))
+        self.set_ns = QComboBox()
+        for ns in adb_actions.SETTING_NAMESPACES:
+            self.set_ns.addItem(ns, ns)
+        ns_row.addWidget(self.set_ns)
+        ns_row.addWidget(QLabel(i18n.tr("set_key")))
+        self.set_key_input = QLineEdit()
+        self.set_key_input.setPlaceholderText(adb_actions.DEV_SETTINGS_KEY)
+        ns_row.addWidget(self.set_key_input, 1)
+        set_form.addLayout(ns_row)
+
+        val_row = QHBoxLayout()
+        val_row.addWidget(QLabel(i18n.tr("set_value")))
+        self.set_value_input = QLineEdit()
+        self.set_value_input.setPlaceholderText("1")
+        val_row.addWidget(self.set_value_input, 1)
+        self.set_get_btn = QPushButton(i18n.tr("set_get_btn"))
+        self.set_get_btn.clicked.connect(self._setting_get)
+        val_row.addWidget(self.set_get_btn)
+        self.set_put_btn = QPushButton(i18n.tr("set_put_btn"))
+        self.set_put_btn.clicked.connect(self._setting_put)
+        val_row.addWidget(self.set_put_btn)
+        set_form.addLayout(val_row)
+
+        self.settings_output = QPlainTextEdit()
+        self.settings_output.setReadOnly(True)
+        self.settings_output.setPlaceholderText(i18n.tr("set_placeholder"))
+        set_form.addWidget(self.settings_output, 1)
+        layout.addWidget(set_box)
+        layout.addStretch(1)
+        return page
+
+    def _maybe_load_settings(self, index):
+        """Значение флага читается при первом открытии вкладки, а не при
+        старте диалога — лишнее соединение только по запросу."""
+        if not self._dev_loaded and self.tabs.widget(index) is self._settings_page:
+            self.refresh_dev_mode()
+
+    def refresh_dev_mode(self):
+        self._busy()
+        self._run(self._on_dev_value, adb_actions.get_setting,
+                  self.ip, "global", adb_actions.DEV_SETTINGS_KEY)
+
+    def _on_dev_value(self, value, exc):
+        if exc:
+            self._failed(exc)
+            return
+        self._idle()
+        self._dev_loaded = True
+        text = (value or "").strip()
+        if text == "null":
+            shown = i18n.tr("dev_value_null")
+        elif text == "1":
+            shown = i18n.tr("dev_value_on")
+        elif text == "0":
+            shown = i18n.tr("dev_value_off")
+        else:
+            shown = text or "—"
+        self.dev_value_label.setText(shown)
+
+    def _toggle_dev(self, enable):
+        self.dev_enable_btn.setEnabled(False)
+        self.dev_disable_btn.setEnabled(False)
+        self._busy()
+        self._run(lambda value, exc: self._on_dev_toggled(enable, value, exc),
+                  adb_actions.set_developer_mode, self.ip, enable)
+
+    def _on_dev_toggled(self, enable, value, exc):
+        self.dev_enable_btn.setEnabled(True)
+        self.dev_disable_btn.setEnabled(True)
+        if exc:
+            self._failed(exc)
+            return
+        self._on_dev_value(value, None)
+        self.status.setText(i18n.tr("dev_enable_ok" if enable
+                                    else "dev_disable_ok"))
+
+    def _open_dev_menu(self):
+        self.dev_open_btn.setEnabled(False)
+        self._busy()
+        self._run(lambda out, exc: self._on_dev_menu(out, exc),
+                  adb_actions.open_developer_settings, self.ip)
+
+    def _on_dev_menu(self, output, exc):
+        self.dev_open_btn.setEnabled(True)
+        self._append_settings("$ am start -a " + adb_actions.DEV_SETTINGS_ACTION,
+                              "" if exc else (output or ""))
+        if exc:
+            self._failed(exc)
+            return
+        self.status.setText(i18n.tr("dev_opened"))
+
+    def _setting_get(self):
+        key = self.set_key_input.text().strip()
+        if not key:
+            self.status.setText(i18n.tr("set_key_required"))
+            return
+        ns = self.set_ns.currentData()
+        self.set_get_btn.setEnabled(False)
+        self._busy()
+        self._run(lambda value, exc: self._on_setting_get(ns, key, value, exc),
+                  adb_actions.get_setting, self.ip, ns, key)
+
+    def _on_setting_get(self, ns, key, value, exc):
+        self.set_get_btn.setEnabled(True)
+        command = f"$ settings get {ns} {key}"
+        if exc:
+            self._append_settings(command, "")
+            self._failed(exc)
+            return
+        self._idle()
+        self._append_settings(command, (value or "").strip())
+        self.status.setText(i18n.tr("set_get_done", ns=ns, name=key,
+                                    value=(value or "").strip() or "—"))
+        if ns == "global" and key == adb_actions.DEV_SETTINGS_KEY:
+            self._on_dev_value(value, None)
+
+    def _setting_put(self):
+        key = self.set_key_input.text().strip()
+        if not key:
+            self.status.setText(i18n.tr("set_key_required"))
+            return
+        ns = self.set_ns.currentData()
+        value = self.set_value_input.text()
+        self.set_put_btn.setEnabled(False)
+        self._busy()
+        self._run(lambda shown, exc: self._on_setting_put(ns, key, value,
+                                                          shown, exc),
+                  self._put_and_verify, ns, key, value)
+
+    def _put_and_verify(self, ns, key, value):
+        """Запись + контрольное чтение (в фоновом потоке)."""
+        adb_actions.put_setting(self.ip, ns, key, value)
+        return adb_actions.get_setting(self.ip, ns, key)
+
+    def _on_setting_put(self, ns, key, value, shown, exc):
+        self.set_put_btn.setEnabled(True)
+        command = f"$ settings put {ns} {key} {value}".rstrip()
+        if exc:
+            self._append_settings(command, "")
+            self._failed(exc)
+            return
+        self._idle()
+        self._append_settings(
+            command,
+            i18n.tr("set_put_done", ns=ns, name=key,
+                    value=(shown or "").strip() or "—"))
+        self.status.setText(i18n.tr("set_put_done", ns=ns, name=key,
+                                    value=(shown or "").strip() or "—"))
+        if ns == "global" and key == adb_actions.DEV_SETTINGS_KEY:
+            self._on_dev_value(shown, None)
+
+    def _append_settings(self, command, output):
+        """Транскрипт команды в поле вывода вкладки настроек."""
+        box = self.settings_output
+        box.appendPlainText(command)
+        box.appendPlainText(output.rstrip() or i18n.tr("shell_empty"))
+        box.appendPlainText("")
 
     def refresh_stats(self):
         self._busy()
@@ -600,7 +799,8 @@ class AdbToolkitDialog(QDialog):
         self._idle()
         self.shell_output.appendPlainText("$ " + (self._shell_history[-1]
                                                   if self._shell_history else ""))
-        self.shell_output.appendPlainText(output.rstrip() or "(пусто)")
+        self.shell_output.appendPlainText(output.rstrip()
+                                          or i18n.tr("shell_empty"))
         self.shell_output.appendPlainText("")
 
     def keyPressEvent(self, event):

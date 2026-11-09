@@ -429,6 +429,65 @@ def check_root(host: str, port: int = 5555, timeout: float = 12.0) -> dict:
     return info
 
 
+# ---------------------------------------------------------------- settings
+SETTING_NAMESPACES = ("global", "secure", "system")
+DEV_SETTINGS_KEY = "development_settings_enabled"
+DEV_SETTINGS_ACTION = "android.settings.APPLICATION_DEVELOPMENT_SETTINGS"
+
+
+def _check_setting_name(namespace: str, key: str) -> None:
+    """Валидация раздела и ключа settings (защита от опечаток и инъекций)."""
+    if namespace not in SETTING_NAMESPACES:
+        raise ActionError(f"unknown settings namespace: {namespace}", "")
+    if not key or any(ch.isspace() for ch in key):
+        raise ActionError(f"invalid settings key: {key!r}", "")
+
+
+def get_setting(host: str, namespace: str, key: str, port: int = 5555,
+                timeout: float = 10.0) -> str:
+    """'settings get <ns> <key>' — значение параметра ('null', '0', '1', …)."""
+    _check_setting_name(namespace, key)
+    return shell(host, f"settings get {namespace} {key}", port, timeout).strip()
+
+
+def put_setting(host: str, namespace: str, key: str, value: str,
+                port: int = 5555, timeout: float = 10.0) -> str:
+    """'settings put <ns> <key> <value>' — запись параметра.
+
+    Значение экранируется для shell устройства: пробелы и спецсимволы
+    не ломают команду (частая ошибка ручного adb — «Too many arguments»).
+    """
+    _check_setting_name(namespace, key)
+    value = "" if value is None else str(value)
+    cmd = f"settings put {namespace} {key} {shlex_quote(value)}"
+    return shell(host, cmd, port, timeout).strip()
+
+
+def set_developer_mode(host: str, enable: bool, port: int = 5555,
+                       timeout: float = 10.0) -> str:
+    """Включает/выключает глобальный флаг development_settings_enabled.
+
+    Это тот самый переключатель, который прошивка прячет от 7 нажатий
+    на «Номер сборки». Возвращает фактическое значение после записи
+    ('1'/'0') — для подтверждения в UI.
+    """
+    put_setting(host, "global", DEV_SETTINGS_KEY,
+                "1" if enable else "0", port, timeout)
+    return get_setting(host, "global", DEV_SETTINGS_KEY, port, timeout)
+
+
+def open_developer_settings(host: str, port: int = 5555,
+                            timeout: float = 8.0) -> str:
+    """Открывает меню «Для разработчиков» на экране устройства (am start).
+
+    Через intent-action вместо имени activity — работает и там, где
+    производитель подменил приложение настроек. Если системных настроек
+    с этим меню нет, устройство вернёт ошибку в выводе — показываем её.
+    """
+    return shell(host, f"am start -a {shlex_quote(DEV_SETTINGS_ACTION)}",
+                 port, timeout).strip()
+
+
 # ---------------------------------------------------------------- logcat
 def logcat_dump(host: str, count: int = 300, priority: str = "",
                 port: int = 5555, timeout: float = 20.0) -> str:
