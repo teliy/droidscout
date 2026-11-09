@@ -29,14 +29,14 @@ from .. import i18n, netprobe
 
 # Протоколы, которые попадают в device.services (осмысленные службы)
 _SERVICE_KEYS = {"http", "https", "ssh", "ftp", "smtp", "pop3", "imap",
-                 "rtsp", "vnc", "telnet", "redis", "irc"}
+                 "rtsp", "vnc", "telnet", "redis", "irc", "repl"}
 
 # Цвета сервисов в таблице (подходят и для тёмной, и для светлой темы)
 SERVICE_COLORS = {
     "http": "#3b82f6", "https": "#14b8a6", "ssh": "#22c55e", "ftp": "#f97316",
     "smtp": "#ec4899", "pop3": "#ec4899", "imap": "#ec4899", "rtsp": "#8b5cf6",
     "vnc": "#ef4444", "telnet": "#f43f5e", "redis": "#d97706", "irc": "#64748b",
-    "binary": "#64748b", "tcp": "#64748b",
+    "repl": "#d946ef", "binary": "#64748b", "tcp": "#64748b",
 }
 
 _UDP_PROBES = (("mdns", "mDNS", netprobe.mdns_probe),

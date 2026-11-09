@@ -143,6 +143,10 @@ def classify(device: Device) -> Device:
     if "airplay" in device.services:
         score += 5
         evidence.append("AirPlay")
+    if "repl" in device.services:
+        # не признак Android, но критичная находка безопасности: открытая
+        # интерактивная консоль = выполнение произвольного кода без пароля
+        evidence.append("Открытая REPL-консоль Python — выполнение кода без аутентификации")
 
     # --- mDNS/SSDP модель и производитель ---
     manuf = (device.manufacturer or "").lower()

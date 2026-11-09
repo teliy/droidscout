@@ -251,6 +251,15 @@ def classify_banner(port: int, raw: bytes) -> Tuple[str, str]:
     if raw.startswith(b"NOTICE") or raw.startswith(b":"):  # IRC-подобные
         return "irc", first_line.decode("latin-1", "replace").strip()
 
+    # Python/MicroPython REPL: приглашение '>>> '/'... ' сразу после соединения,
+    # баннер MicroPython или traceback в ответ на наш зонд — интерактивная
+    # консоль без аутентификации (важная находка безопасности)
+    if (b"MicroPython" in text_head
+            or b"Traceback (most recent call last)" in text_head
+            or re.match(rb"[\r\n \t]*(>>> |\.\.\. )", raw)):
+        head = first_line.decode("latin-1", "replace").strip()[:120]
+        return "repl", head or "Python REPL (>>>)"
+
     # telnet: IAC-последовательности или приглашение login
     if raw[:1] == b"\xff" or b"\xff\xfb" in raw[:64] or b"\xff\xfd" in raw[:64]:
         return "telnet", "IAC"
