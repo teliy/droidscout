@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (QDialog, QFileDialog, QGridLayout, QHBoxLayout,
                                QPushButton, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QApplication, QGroupBox)
 
-from .. import i18n, netprobe
+from .. import i18n, netprobe, repl_probe
 
 # Протоколы, которые попадают в device.services (осмысленные службы)
 _SERVICE_KEYS = {"http", "https", "ssh", "ftp", "smtp", "pop3", "imap",
@@ -163,6 +163,32 @@ def _hexdump(data: bytes, limit: int = 512) -> str:
     return "\n".join(lines)
 
 
+class ReplWorker(QThread):
+    """Опрашивает найденную REPL-консоль читающими командами (без Qt-логики)."""
+
+    repl_done = Signal(object)          # dict из repl_probe.interview
+
+    def __init__(self, ip: str, port: int, stop_event: threading.Event,
+                 parent=None):
+        super().__init__(parent)
+        self.ip = ip
+        self.port = port
+        self._stop_event = stop_event
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        try:
+            res = repl_probe.interview(self.ip, self.port,
+                                       should_stop=self._stop_event.is_set)
+        except Exception as exc:  # noqa: BLE001 — ошибка не должна ронять диалог
+            res = {"port": self.port, "ok": False, "transcript": "",
+                   "answers": {}, "error": str(exc)[:160], "seconds": 0.0}
+        res["port"] = self.port
+        self.repl_done.emit(res)
+
+
 class DeepScanDialog(QDialog):
     """Немодальное окно глубокого опроса одного устройства.
 
@@ -188,6 +214,11 @@ class DeepScanDialog(QDialog):
         self._t_start = time.monotonic()
         self._open_count = 0
         self._tls_count = 0
+        self._repl_ports = set()             # порты, опознанные как REPL
+        self._repl_done_ports = set()        # уже опрошенные (для автоопроса)
+        self._repl_worker: "ReplWorker | None" = None
+        self._repl_running_port = 0
+        self._repl_stop = threading.Event()
 
         self.setWindowTitle(i18n.tr("ds_title", ip=device.ip))
         self.resize(900, 660)
@@ -290,6 +321,10 @@ class DeepScanDialog(QDialog):
         self.browser_btn.setEnabled(False)
         self.browser_btn.clicked.connect(self._open_browser)
         actions.addWidget(self.browser_btn)
+        self.repl_btn = QPushButton(i18n.tr("ds_repl_btn"))
+        self.repl_btn.setEnabled(False)
+        self.repl_btn.clicked.connect(self._on_repl_btn)
+        actions.addWidget(self.repl_btn)
         copy_btn = QPushButton(i18n.tr("ds_copy"))
         copy_btn.clicked.connect(self._copy_raw)
         actions.addWidget(copy_btn)
@@ -407,6 +442,13 @@ class DeepScanDialog(QDialog):
             self.table.selectRow(0)
         if proto in ("http", "https"):
             self.browser_btn.setEnabled(True)
+        if proto == "repl":
+            # консоль найдена — сразу сами спрашиваем её, кто она (только чтение)
+            self._repl_ports.add(port)
+            if (port not in self._repl_done_ports
+                    and self._repl_worker is None):
+                self._start_repl(port)
+        self._update_repl_btn()
         self._refresh_summary()
 
     def _on_udp_step(self, key: str, running: bool):
@@ -480,6 +522,80 @@ class DeepScanDialog(QDialog):
             return None
         return self._by_port.get(item.data(Qt.UserRole))
 
+    # -------------------------------------------------------- REPL-опрос
+    def _update_repl_btn(self):
+        """Кнопка REPL: активна, когда выбран REPL-порт и опрос не идёт."""
+        if self._repl_worker is not None:
+            self.repl_btn.setEnabled(False)
+            self.repl_btn.setText(i18n.tr("ds_repl_running"))
+            return
+        info = self._selected()
+        is_repl = bool(info) and info.get("proto") == "repl"
+        self.repl_btn.setEnabled(is_repl)
+        if is_repl and int(info.get("port") or 0) in self._repl_done_ports:
+            self.repl_btn.setText(i18n.tr("ds_repl_again"))
+        else:
+            self.repl_btn.setText(i18n.tr("ds_repl_btn"))
+
+    def _on_repl_btn(self):
+        info = self._selected()
+        if not info or info.get("proto") != "repl":
+            return
+        self._start_repl(int(info["port"]))
+
+    def _start_repl(self, port: int):
+        if self._repl_worker is not None:
+            return
+        self._repl_stop = threading.Event()
+        self._repl_running_port = port
+        self._repl_worker = ReplWorker(self.device.ip, port,
+                                       self._repl_stop, self)
+        self._repl_worker.repl_done.connect(self._on_repl_result)
+        self._repl_worker.start()
+        self._update_repl_btn()
+        info = self._selected()
+        if info and int(info.get("port") or 0) == port:
+            self._show_raw()
+
+    def _format_repl(self, result: dict) -> str:
+        """Текст REPL-опроса для панели «Сырой ответ» и отчёта."""
+        lines = [i18n.tr("ds_repl_title", sec=max(1, int(result.get("seconds") or 0))),
+                 "-" * 60]
+        transcript = str(result.get("transcript") or "").strip()
+        if transcript:
+            lines.append(transcript)
+            lines.append("-" * 60)
+        facts = repl_probe.facts_block(result.get("answers") or {})
+        if facts:
+            lines.append(i18n.tr("ds_repl_facts"))
+            lines.append(facts)
+        if not result.get("ok"):
+            lines.append(i18n.tr("ds_repl_fail",
+                                 err=str(result.get("error") or "?")[:160]))
+        return "\n".join(lines)
+
+    def _on_repl_result(self, result: dict):
+        port = int(result.get("port") or 0)
+        self._repl_done_ports.add(port)
+        self._repl_worker = None
+        self._repl_running_port = 0
+        info = self._by_port.get(port)
+        if info is not None:
+            info["repl_result"] = result
+            info["repl_text"] = self._format_repl(result)
+            summary = repl_probe.summary_line(result.get("answers") or {})
+            info["repl_summary"] = summary
+            # признак добавляем один раз и только с реальной сводкой: иначе
+            # неудавшийся первый опрос заблокирует признак успешного повтора
+            if summary and not info.get("repl_evidenced"):
+                info["repl_evidenced"] = True
+                self.device.evidence.append(
+                    i18n.tr("ds_repl_evidence", info=summary))
+        self._update_repl_btn()
+        if self._selected() is info:
+            self._show_raw()
+        self._refresh_summary()
+
     def _show_raw(self, *_):
         info = self._selected()
         if not info:
@@ -502,6 +618,13 @@ class DeepScanDialog(QDialog):
             lines.append(_hexdump(raw))
         else:
             lines.append(i18n.tr("ds_no_reply"))
+        if info.get("repl_text"):
+            lines.append("")
+            lines.append(str(info.get("repl_text")))
+        elif (self._repl_worker is not None
+                and int(info.get("port") or 0) == self._repl_running_port):
+            lines.append("")
+            lines.append(i18n.tr("ds_repl_wait"))
         self.raw.setPlainText("\n".join(lines))
 
     def _open_browser(self):
@@ -556,6 +679,8 @@ class DeepScanDialog(QDialog):
                         fh.write("-" * 64 + "\n" + _hexdump(raw, limit=1024) + "\n")
                     else:
                         fh.write(i18n.tr("ds_no_reply") + "\n")
+                    if info.get("repl_text"):
+                        fh.write("\n" + str(info.get("repl_text")) + "\n")
                 udp_lines = [f"  {label}: {self._udp_lines.get(key) or '—'}"
                              for key, label, _fn in _UDP_PROBES]
                 fh.write("\n" + i18n.tr("ds_udp_gb") + "\n" + "\n".join(udp_lines) + "\n")
@@ -598,6 +723,11 @@ class DeepScanDialog(QDialog):
         self.worker.stop()
         if not self.worker.wait(3000):
             self.worker.terminate()
+        if self._repl_worker is not None:
+            self._repl_worker.stop()
+            if not self._repl_worker.wait(2000):
+                self._repl_worker.terminate()
+            self._repl_worker = None
         # даже при досрочном закрытии переносим то, что успели собрать
         self._merge_device()
         super().closeEvent(event)
