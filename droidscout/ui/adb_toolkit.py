@@ -16,10 +16,10 @@ import re
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QImage, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
-                               QFileDialog, QFormLayout, QGridLayout,
+                               QFileDialog, QFormLayout, QFrame, QGridLayout,
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QMessageBox, QPlainTextEdit, QPushButton,
-                               QSpinBox, QTabWidget, QTreeWidget,
+                               QScrollArea, QSpinBox, QTabWidget, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .. import adb_actions, exporter, i18n, journal
@@ -180,6 +180,16 @@ class AdbToolkitDialog(QDialog):
         btn_row.addStretch(1)
         form.addRow(btn_row)
 
+        # Перезагрузка — выше блока «Экран»: видна сразу, без прокрутки.
+        reboot_box = QGroupBox(i18n.tr("reboot_group"))
+        reboot_row = QHBoxLayout(reboot_box)
+        for mode, key in (("", "reboot_normal"), ("recovery", "reboot_recovery"),
+                          ("bootloader", "reboot_bootloader")):
+            btn = QPushButton(i18n.tr(key))
+            btn.clicked.connect(lambda _=False, m=mode: self._reboot(m))
+            reboot_row.addWidget(btn)
+        form.addRow(reboot_box)
+
         screen_box = QGroupBox(i18n.tr("screen_group"))
         screen_grid = QGridLayout(screen_box)
         self._wm_fn = {"size": adb_actions.wm_size_set,
@@ -207,15 +217,17 @@ class AdbToolkitDialog(QDialog):
         screen_grid.addWidget(screen_hint, 3, 0, 1, 4)
         form.addRow(screen_box)
 
-        reboot_box = QGroupBox(i18n.tr("reboot_group"))
-        reboot_row = QHBoxLayout(reboot_box)
-        for mode, key in (("", "reboot_normal"), ("recovery", "reboot_recovery"),
-                          ("bootloader", "reboot_bootloader")):
-            btn = QPushButton(i18n.tr(key))
-            btn.clicked.connect(lambda _=False, m=mode: self._reboot(m))
-            reboot_row.addWidget(btn)
-        form.addRow(reboot_box)
-        return page
+        # Прокрутка: с блоками «Экран» и «Перезагрузка» вкладка может не
+        # влезать по высоте — всё содержимое доступно скроллом.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(page)
+        outer = QWidget()
+        outer_lay = QVBoxLayout(outer)
+        outer_lay.setContentsMargins(0, 0, 0, 0)
+        outer_lay.addWidget(scroll)
+        return outer
 
     # ------------------------------------------------------------ таб: Настройки
     def _tab_settings(self):
@@ -316,8 +328,19 @@ class AdbToolkitDialog(QDialog):
         self.settings_output.setPlaceholderText(i18n.tr("set_placeholder"))
         set_form.addWidget(self.settings_output, 1)
         layout.addWidget(set_box)
+        self.settings_output.setMinimumHeight(140)
         layout.addStretch(1)
-        return page
+
+        # Прокрутка на случай маленького окна (блоков стало больше).
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(page)
+        outer = QWidget()
+        outer_lay = QVBoxLayout(outer)
+        outer_lay.setContentsMargins(0, 0, 0, 0)
+        outer_lay.addWidget(scroll)
+        return outer
 
     def _maybe_load_settings(self, index):
         """Значения флагов читаются при первом открытии вкладки, а не при
