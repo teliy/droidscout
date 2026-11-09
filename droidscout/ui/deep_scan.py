@@ -9,7 +9,8 @@
      выполняется прямо сейчас.
 
 Найденное переносится в Device и в карточку устройства; отчёт можно
-сохранить в текстовый файл для дальнейшего анализа.
+сохранить в текстовый файл, а ответы всех портов разом — скопировать
+в буфер обмена одним текстом.
 """
 
 import datetime
@@ -160,6 +161,71 @@ def _hexdump(data: bytes, limit: int = 512) -> str:
         lines.append(f"{offset:04x}  {hexpart:<47}  {text}")
     if len(data) > limit:
         lines.append(f"… ({len(data) - limit} байт показано первые {limit})")
+    return "\n".join(lines)
+
+
+def _answer_body(raw: bytes, limit: int = 4096) -> str:
+    """Текст ответа для агрегата: UTF-8, почти-текст или пометка о бинарке.
+
+    Бинарные протоколы (ADB CNXN, TLS, …) узнаём по управляющим байтам:
+    NUL-байты — «валидный UTF-8», без этой проверки в буфер попадает каша.
+    Для бинарных ответов — короткая пометка и компактный hexdump.
+    """
+    if not raw:
+        return ""
+    if any(b < 32 and b not in (9, 10, 13) or b == 127 for b in raw):
+        return (i18n.tr("ds_bin_reply", n=len(raw)) + "\n"
+                + _hexdump(raw, limit=128))
+    try:
+        return raw.decode("utf-8")[:limit]
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1", "replace")
+        printable = sum(1 for ch in text if ch.isprintable() or ch in "\r\n\t")
+        if printable / max(len(text), 1) >= 0.85:
+            return text[:limit]
+    return (i18n.tr("ds_bin_reply", n=len(raw)) + "\n" + _hexdump(raw, limit=128))
+
+
+def aggregate_answers(device, results, udp_lines=None) -> str:
+    """Ответы всех портов одним текстом — для кнопки «Скопировать все ответы».
+
+    Чистая функция (без self) — тестируется без Qt. По каждому порту:
+    служба, TLS-сертификат (если есть), краткий разбор, текст ответа;
+    REPL-порты получают итог опроса, молчащие — строку «нет ответа».
+    В конце — UDP-разведка, если хоть одна проба что-то услышала.
+    """
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [f"{i18n.tr('ds_copy_all_title')} — {stamp}",
+             _device_context(device)]
+    for info in sorted(results, key=lambda i: int(i["port"])):
+        proto = str(info.get("proto") or "")
+        head = f"tcp/{info['port']}"
+        if info.get("tls"):
+            head += " · TLS"
+        if proto:
+            head += f" · {proto.upper()}"
+        lines.append("")
+        lines.append(head)
+        if info.get("cert_cn") or info.get("cert_issuer"):
+            lines.append(f"cert CN: {info.get('cert_cn') or '—'}"
+                         f" | issuer: {info.get('cert_issuer') or '—'}")
+        detail = str(info.get("detail") or "").strip()
+        if detail:
+            lines.append(detail[:200])
+        body = _answer_body(info.get("raw") or b"").strip()
+        if body:
+            lines.append(body)
+        elif not detail:
+            lines.append(i18n.tr("ds_no_reply"))
+        repl = str(info.get("repl_text") or "").strip()
+        if repl:
+            lines.append("")
+            lines.append(repl)
+    udp = udp_lines or {}
+    udp_vals = [f"{label}: {str(udp.get(key))[:200]}"
+                for key, label, _fn in _UDP_PROBES if udp.get(key)]
+    if udp_vals:
+        lines += ["", i18n.tr("ds_udp_gb")] + udp_vals
     return "\n".join(lines)
 
 
@@ -329,6 +395,11 @@ class DeepScanDialog(QDialog):
         copy_btn = QPushButton(i18n.tr("ds_copy"))
         copy_btn.clicked.connect(self._copy_raw)
         actions.addWidget(copy_btn)
+        self.copy_all_btn = QPushButton(i18n.tr("ds_copy_all"))
+        self.copy_all_btn.setToolTip(i18n.tr("ds_copy_all_hint"))
+        self.copy_all_btn.setEnabled(False)   # включится с первым ответом
+        self.copy_all_btn.clicked.connect(self._copy_all_answers)
+        actions.addWidget(self.copy_all_btn)
         self.save_btn = QPushButton(i18n.tr("ds_save"))
         self.save_btn.clicked.connect(self._save_report)
         actions.addWidget(self.save_btn)
@@ -417,6 +488,7 @@ class DeepScanDialog(QDialog):
         self._open_count += 1
         if info.get("tls"):
             self._tls_count += 1
+        self.copy_all_btn.setEnabled(True)   # уже есть что копировать
 
         proto = str(info.get("proto") or "")
         proto_text = proto.upper() if proto else i18n.tr("ds_no_reply")
@@ -474,6 +546,8 @@ class DeepScanDialog(QDialog):
         self._udp_lines[key] = text
         label.setText(text[:80] if text else "—")
         label.setStyleSheet("color:#8a90a0;" if not text else "")
+        if text:
+            self.copy_all_btn.setEnabled(True)
 
     def _refresh_summary(self):
         sec = int(time.monotonic() - self._t_start)
@@ -641,6 +715,12 @@ class DeepScanDialog(QDialog):
 
     def _copy_raw(self):
         QApplication.clipboard().setText(self.raw.toPlainText())
+
+    def _copy_all_answers(self):
+        """Агрегат ответов всех портов — в буфер обмена одним текстом."""
+        QApplication.clipboard().setText(
+            aggregate_answers(self.device, self._results, self._udp_lines))
+        self.summary.setText(i18n.tr("ds_copied_all"))
 
     def _save_report(self):
         default = os.path.join(os.path.expanduser("~"),
