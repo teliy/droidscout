@@ -14,14 +14,15 @@ import os
 import re
 import threading
 
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QObject, QRect, QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QImage, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                                QFileDialog, QFormLayout, QFrame, QGridLayout,
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QMenu, QMessageBox, QPlainTextEdit,
                                QProgressDialog, QPushButton, QScrollArea,
-                               QSpinBox, QTabWidget, QTreeWidget,
+                               QSpinBox, QStyle, QStyledItemDelegate,
+                               QStyleOptionViewItem, QTabWidget, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .. import adb_actions, exporter, favorites, hw_info, i18n, journal
@@ -39,6 +40,53 @@ APPS_COLUMNS = ("pkg", "version", "path")
 _PROTO_ERR_RE = re.compile(r"corrupted|closed by device|handshake|unexpected packet", re.I)
 
 VT_URL = "https://www.virustotal.com/gui/search/"
+
+
+class _HwWrapDelegate(QStyledItemDelegate):
+    """Перенос длинных значений по словам в колонке «Значение».
+
+    QTreeWidget по умолчанию обрезает длинный текст (сборка ядра, строки
+    GLES, device-tree), а единая высота строк не даёт показать его целиком.
+    Делегат рисует текст с переносом и вычисляет высоту строки так, чтобы
+    влезал весь текст; колонка «Параметр» остаётся без изменений.
+    """
+
+    PAD = 10  # запас по краям ячейки, чтобы текст не прилипал к границе
+
+    def __init__(self, tree, col):
+        super().__init__(tree)
+        self._tree = tree
+        self._col = col
+
+    def _opt(self, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.features |= QStyleOptionViewItem.WrapText
+        opt.textElideMode = Qt.ElideNone
+        return opt
+
+    def paint(self, painter, option, index):
+        opt = self._opt(option, index)
+        painter.save()
+        painter.setClipRect(option.rect)
+        style = opt.widget.style() if opt.widget is not None \
+            else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        if index.column() != self._col:
+            return super().sizeHint(option, index)
+        opt = self._opt(option, index)
+        width = self._tree.columnWidth(self._col) - 2 * self.PAD
+        if width < 60:
+            width = 60
+        rect = opt.fontMetrics.boundingRect(
+            QRect(0, 0, width, 100000),
+            Qt.TextWordWrap | Qt.TextWrapAnywhere, opt.text)
+        base = super().sizeHint(option, index)
+        height = max(base.height(), rect.height() + self.PAD)
+        return QSize(base.width(), height)
 
 
 # ------------------------------------------------------------- формат железа
@@ -404,7 +452,12 @@ class AdbToolkitDialog(QDialog):
         self.hw_tree.setHeaderLabels([i18n.tr("hw_col_param"),
                                       i18n.tr("hw_col_value")])
         self.hw_tree.setColumnWidth(0, 250)
-        self.hw_tree.setUniformRowHeights(True)
+        # Длинные значения (сборка ядра, GLES, device-tree) переносим по словам,
+        # а не обрезаем: высота строки подгоняется под весь текст.
+        self.hw_tree.setItemDelegateForColumn(
+            1, _HwWrapDelegate(self.hw_tree, 1))
+        # При смене ширины колонки высоты строк пересчитываются под новый перенос.
+        self.hw_tree.header().sectionResized.connect(self._hw_relayout)
         layout.addWidget(self.hw_tree, 1)
 
         btn_row = QHBoxLayout()
@@ -421,6 +474,10 @@ class AdbToolkitDialog(QDialog):
     def refresh_hw(self):
         self._busy("hw_busy")
         self._run(self._on_hw, hw_info.read_hw, self.ip)
+
+    def _hw_relayout(self, *args):
+        """Пересчитать высоты строк после изменения ширины колонки."""
+        self.hw_tree.doItemsLayout()
 
     def _on_hw(self, hw, exc):
         if exc:
@@ -457,7 +514,13 @@ class AdbToolkitDialog(QDialog):
         for param, value in rows:
             if not param and not value:
                 continue
-            head.addChild(QTreeWidgetItem([param or "", value or ""]))
+            child = QTreeWidgetItem([param or "", value or ""])
+            # Полный текст доступен и во всплывающей подсказке.
+            if len(value or "") > 60:
+                child.setToolTip(1, value)
+            if len(param or "") > 60:
+                child.setToolTip(0, param)
+            head.addChild(child)
         head.setExpanded(True)
 
     @staticmethod
@@ -713,7 +776,7 @@ class AdbToolkitDialog(QDialog):
         self._hw_section(tree, i18n.tr("hw_sec_kernel"), [
             (i18n.tr("hw_kernel_ver"), kernel.get("version", "")),
             (i18n.tr("hw_kernel_raw"),
-             (kernel.get("raw", "") or "")[:160]),
+             (kernel.get("raw", "") or "")[:300]),
             (i18n.tr("hw_kernel_arch"),
              _hw_arch_label(kernel.get("arch")) or kernel.get("arch", "")),
             (i18n.tr("hw_uptime"), i18n.tr("stat_uptime_fmt", days=days,
