@@ -941,11 +941,13 @@ def list_dir(host: str, path: str = "/", port: int = 5555,
         command = " ".join(filter(None, ("ls", flags, quoted)))
         text = shell(host, command, port, timeout)
         if "Permission denied" in text:
+            # права не зависят от флагов ls — сразу к ответу, не гоняем
+            # все 4 варианта (важно для перебора псевдонимов в list_dir_any)
             denied = True
-            continue
+            break
         if "No such file or directory" in text:
             no_path = True
-            continue
+            break
         entries = parse_ls_l(text)
         if entries:
             entries = [e for e in entries if e["name"] not in (".", "..")]
@@ -971,6 +973,72 @@ def list_dir(host: str, path: str = "/", port: int = 5555,
     if denied:
         raise ActionError(f"ls: Permission denied: {path}", "denied")
     return {"path": path, "entries": [], "via": "ls"}
+
+
+# -------------------------------- псевдонимы пользовательского хранилища
+# Порядок важен: маршруты с более длинным префиксом — раньше.
+# На многих прошивках (особенно ТВ-боксы) adb-shell не может даже
+# прочитать список каталога /storage/emulated (права только у root),
+# но /storage/emulated/0, /sdcard и /mnt/sdcard работают — там
+# sdcardfs даёт доступ группе shell, а /sdcard проходит через
+# монтирование пользовательского пространства.
+_STORAGE_ROUTES = (
+    ("/storage/emulated/0",
+     ("/sdcard", "/storage/self/primary", "/mnt/sdcard")),
+    ("/storage/emulated",
+     ("/storage/emulated/0", "/sdcard", "/storage/self/primary",
+      "/mnt/sdcard")),
+    ("/storage/self/primary",
+     ("/sdcard", "/storage/emulated/0", "/mnt/sdcard")),
+    ("/sdcard",
+     ("/storage/self/primary", "/storage/emulated/0", "/mnt/sdcard")),
+)
+
+
+def storage_alternates(path: str) -> "list[str]":
+    """Псевдонимы того же каталога хранилища, если сам путь закрыт.
+
+    /storage/emulated -> [/storage/emulated/0, /sdcard, ...],
+    /storage/emulated/0/Download -> [/sdcard/Download, ...].
+    Для путей вне пользовательского хранилища — пустой список.
+    """
+    clean = (path or "").strip().rstrip("/") or "/"
+    for prefix, aliases in _STORAGE_ROUTES:
+        if clean == prefix:
+            return list(aliases)
+        if clean.startswith(prefix + "/"):
+            tail = clean[len(prefix):]          # начинается с "/"
+            return [alias + tail for alias in aliases]
+    return []
+
+
+def list_dir_any(host: str, paths, port: int = 5555,
+                 timeout: float = 10.0, requested: str = "") -> dict:
+    """Первый удачный list_dir из кандидатов-псевдонимов.
+
+    Авто-переход с закрытого правами /storage/emulated на /sdcard:
+    перебирает paths, у первого удачного листинга ставит
+    'requested' = исходный путь (если он отличается от открытого).
+    Не сработал ни один — перебрасывает последнюю ошибку
+    (обычно 'denied' — UI покажет подсказку про root).
+    """
+    last_error: "ActionError | None" = None
+    for candidate in (paths or ()):                  # псевдонимы без исходного пути
+        if not candidate:
+            continue
+        try:
+            listing = list_dir(host, candidate, port=port, timeout=timeout)
+        except ActionError as exc:
+            last_error = exc
+            if exc.code not in ("denied", "nopath"):
+                raise                                # обрыв связи — перебор бессмыслен
+            continue
+        if requested and (requested.rstrip("/")
+                          != str(listing.get("path", "")).rstrip("/")):
+            listing["requested"] = requested
+        return listing
+    raise last_error or ActionError(
+        f"ls: no readable alias: {requested}", "denied")
 
 
 def pull_file(host: str, remote_path: str, port: int = 5555,

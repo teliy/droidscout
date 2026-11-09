@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (QDialog, QFileDialog, QGridLayout, QHBoxLayout,
                                QVBoxLayout, QApplication, QGroupBox)
 
 from .. import i18n, netprobe, repl_probe
+from .sort_items import NaturalTableItem
 
 # Протоколы, которые попадают в device.services (осмысленные службы)
 _SERVICE_KEYS = {"http", "https", "ssh", "ftp", "smtp", "pop3", "imap",
@@ -344,6 +345,7 @@ class DeepScanDialog(QDialog):
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setWordWrap(False)
+        self.table.setSortingEnabled(True)
         self.table.selectionModel().selectionChanged.connect(self._show_raw)
         layout.addWidget(self.table, 5)
 
@@ -498,18 +500,18 @@ class DeepScanDialog(QDialog):
 
         row = self.table.rowCount()
         self.table.insertRow(row)
-        item_port = QTableWidgetItem(str(port))
+        item_port = NaturalTableItem(str(port))
         item_port.setData(Qt.UserRole, port)
         item_port.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.table.setItem(row, 0, item_port)
-        item_svc = QTableWidgetItem(proto_text)
+        item_svc = NaturalTableItem(proto_text)
         color = QColor(SERVICE_COLORS.get(proto, "#64748b"))
         item_svc.setForeground(color)
         font = QFont()
         font.setBold(True)
         item_svc.setFont(font)
         self.table.setItem(row, 1, item_svc)
-        self.table.setItem(row, 2, QTableWidgetItem(detail[:220]))
+        self.table.setItem(row, 2, NaturalTableItem(detail[:220]))
         self.table.sortByColumn(0, Qt.AscendingOrder)
         if self.table.currentRow() < 0:
             self.table.selectRow(0)

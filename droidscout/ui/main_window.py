@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QStatusBar, QTabWidget, QTableView, QToolBar, QToolButton, QVBoxLayout,
     QWidget, QHeaderView, QAbstractItemView)
 
-from .. import __version__, APP_NAME, adb_actions, adb_info, config, exporter, i18n, netprobe, scanner, storage
+from .. import __version__, APP_NAME, adb_actions, adb_info, config, exporter, favorites, i18n, netprobe, scanner, storage
 from .. import fingerprint
 from ..fingerprint import Device, type_label, verdict_label
 from .device_model import DeviceModel
@@ -32,6 +32,9 @@ class MainWindow(QMainWindow):
         self.update_worker = None
         self.scan_started = 0.0
         self._last_scan_devices = []
+        self._live_devices = []             # все найденные за скан (канонический список)
+        self._fav_only = False
+        self.favorites = set(favorites.load(favorites.DEVICES_KEY))
 
         self.setWindowTitle(self._base_title())
         self.setWindowIcon(app_icon())
@@ -43,6 +46,8 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
 
         storage.init()
+        self.model.set_favorites(self.favorites)
+        self.history_model.set_favorites(self.favorites)
         self._refresh_history()
 
     def _base_title(self) -> str:
@@ -78,6 +83,13 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_scan)
         toolbar.addWidget(self.stop_btn)
+
+        self.fav_btn = QToolButton()
+        self.fav_btn.setText(i18n.tr("fav_filter"))
+        self.fav_btn.setCheckable(True)
+        self.fav_btn.setToolTip(i18n.tr("fav_filter_hint"))
+        self.fav_btn.toggled.connect(self._set_fav_only)
+        toolbar.addWidget(self.fav_btn)
         toolbar.addSeparator()
 
         self.net_label = QLabel(i18n.tr("network"))
@@ -163,6 +175,8 @@ class MainWindow(QMainWindow):
         header.resizeSection(9, 140)   # services
         header.resizeSection(10, 80)   # status
         self.table.setSortingEnabled(True)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._table_context_menu)
         self.table.selectionModel().selectionChanged.connect(self._on_selection)
         splitter.addWidget(self.table)
 
@@ -287,6 +301,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, i18n.tr("err_title"), i18n.tr("no_networks"))
                 return
         networks = net.split("|")
+        self._live_devices = []
         self.model.set_devices([])
         self.details.setPlainText(i18n.tr("details_none"))
         self.scan_started = time.monotonic()
@@ -311,6 +326,10 @@ class MainWindow(QMainWindow):
             self.status_label.setText(i18n.tr("scan_stopped"))
 
     def _on_device(self, device):
+        self._live_devices.append(device)
+        # фильтр «Избранные» активен — не показываем чужих
+        if self._fav_only and not favorites.device_hit(self.favorites, device):
+            return
         self.model.add_device(device)
 
     def _on_progress(self, key, done, total):
@@ -335,8 +354,10 @@ class MainWindow(QMainWindow):
 
         devices = devices or []
         self._last_scan_devices = devices
+        self._live_devices = list(devices)
         self._mark_new_devices(devices)
-        self.model.set_devices(devices)
+        self.model.set_devices(self._visible_devices(devices))
+        self._reapply_sort()
         network = self.net_combo.currentData() or ""
         try:
             storage.save_scan(network, devices)
@@ -356,6 +377,58 @@ class MainWindow(QMainWindow):
         new = sum(1 for d in devices if d.is_new)
         self.counts_label.setText(i18n.tr("devices_found", total=total,
                                           android=android, new=new))
+
+    # ------------------------------------------------------------- избранное
+    def _set_fav_only(self, on: bool):
+        """Тумблер «★ Избранные» в тулбаре."""
+        self._fav_only = bool(on)
+        self._apply_fav_view()
+        if on and not self.favorites:
+            self.status_label.setText(i18n.tr("fav_empty"))
+
+    def _visible_devices(self, devices):
+        """Полный список или только избранные (по MAC/IP)."""
+        if not self._fav_only:
+            return list(devices or [])
+        return [d for d in devices or []
+                if favorites.device_hit(self.favorites, d)]
+
+    def _apply_fav_view(self):
+        self.model.set_devices(self._visible_devices(
+            self._live_devices or self._last_scan_devices))
+        self._reapply_sort()
+
+    def _reapply_sort(self):
+        """После reset строки в порядке добавления — повторяем сортировку
+        по индикатору заголовка (иначе после каждого скана порядок сбрасывается)."""
+        header = self.table.horizontalHeader()
+        if self.table.isSortingEnabled() and header.sortIndicatorSection() >= 0:
+            self.table.sortByColumn(header.sortIndicatorSection(),
+                                    header.sortIndicatorOrder())
+
+    def _table_context_menu(self, pos):
+        """Правый клик по таблице: поставить/снять звезду устройства."""
+        index = self.table.indexAt(pos)
+        device = self.model.device_at(index.row()) if index.isValid() else None
+        if not device:
+            return
+        menu = QMenu(self)
+        is_fav = favorites.device_hit(self.favorites, device)
+        action = menu.addAction(i18n.tr("fav_remove" if is_fav else "fav_add"))
+        if menu.exec(self.table.viewport().mapToGlobal(pos)) is not action:
+            return
+        if is_fav:
+            favorites.device_remove_both(favorites.DEVICES_KEY, device)
+            self.favorites = set(favorites.load(favorites.DEVICES_KEY))
+            self.status_label.setText(i18n.tr("fav_removed", name=device.ip))
+        else:
+            self.favorites.add(favorites.device_key(device))
+            favorites.save(favorites.DEVICES_KEY, sorted(self.favorites))
+            self.status_label.setText(i18n.tr("fav_added", name=device.ip))
+        self.model.set_favorites(self.favorites)
+        self.history_model.set_favorites(self.favorites)
+        if self._fav_only:
+            self._apply_fav_view()
 
     # ------------------------------------------------------------- детали
     def _on_selection(self):
@@ -600,6 +673,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(self._base_title())
         self.scan_btn.setText(i18n.tr("scan"))
         self.stop_btn.setText(i18n.tr("scan_stop"))
+        self.fav_btn.setText(i18n.tr("fav_filter"))
         self.net_label.setText(i18n.tr("network"))
         self.export_btn.setText(i18n.tr("export"))
         self.csv_action.setText(i18n.tr("export_csv"))

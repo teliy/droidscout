@@ -19,6 +19,8 @@ DEFAULTS: Dict[str, Any] = {
     "scan_timeout_ms": 1500,
     "adb_native": True,          # встроенный ADB-клиент (без platform-tools)
     "adb_path": "",              # путь к внешнему adb; пусто -> автопоиск
+    "fav_devices": [],           # избранные устройства (MAC, либо IP без MAC)
+    "fav_apps": [],              # избранные приложения (имена пакетов)
 }
 
 _lock = threading.Lock()

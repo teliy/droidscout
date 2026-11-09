@@ -5,7 +5,7 @@ from typing import List
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor, QFont
 
-from .. import i18n
+from .. import favorites, i18n, sortutil
 from ..fingerprint import Device, type_label, verdict_label
 
 COLUMNS = ("ip", "mac", "vendor", "hostname", "device_type", "model",
@@ -26,6 +26,7 @@ class DeviceModel(QAbstractTableModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.devices: List[Device] = []
+        self.favorites = set()               # ключи (MAC/IP) избранных
 
     # Структура --------------------------------------------------------------
     def rowCount(self, parent=QModelIndex()):
@@ -52,7 +53,8 @@ class DeviceModel(QAbstractTableModel):
 
         if role == Qt.DisplayRole:
             if column == "ip":
-                return device.ip
+                starred = "★ " if favorites.device_hit(self.favorites, device) else ""
+                return starred + device.ip
             if column == "mac":
                 return device.mac or "—"
             if column == "vendor":
@@ -124,6 +126,63 @@ class DeviceModel(QAbstractTableModel):
         self.beginResetModel()
         self.devices = list(devices)
         self.endResetModel()
+
+    def set_favorites(self, favs) -> None:
+        """Новый набор избранного -> перерисовать колонку IP (звёздочки)."""
+        self.favorites = set(favs or ())
+        if self.devices:
+            self.dataChanged.emit(self.index(0, 0),
+                                  self.index(len(self.devices) - 1, 0))
+
+    def sort(self, column, order):
+        """Сортировка по клику на заголовок.
+
+        Без этого метода QAbstractTableModel рисует стрелки в заголовке,
+        но не переставляет строки (дефолтный sort() пустой) — тот самый
+        баг «стрелочки переключаются, а порядок не меняется». Числа
+        (уверенность, порты) — по значению, IP — по октетам, текст —
+        естественным порядком.
+        """
+        if not 0 <= column < len(COLUMNS) or len(self.devices) < 2:
+            return
+        self.layoutAboutToBeChanged.emit()
+        reverse = Qt.SortOrder(order) == Qt.DescendingOrder
+        key_func = self._sort_key(COLUMNS[column])
+        order_rows = sorted(range(len(self.devices)),
+                            key=lambda row: key_func(self.devices[row]),
+                            reverse=reverse)
+        if order_rows != list(range(len(self.devices))):
+            for persistent in self.persistentIndexList():
+                if persistent.isValid():
+                    self.changePersistentIndex(
+                        persistent,
+                        self.index(order_rows.index(persistent.row()),
+                                   persistent.column()))
+            self.devices = [self.devices[row] for row in order_rows]
+        self.layoutChanged.emit()
+
+    @staticmethod
+    def _sort_key(field: str):
+        """Ключ строки для колонки: числа — числами, IP — по октетам."""
+        if field == "ip":
+            return lambda d: sortutil.ip_key(d.ip)
+        if field == "confidence":
+            return lambda d: (d.confidence,)
+        if field == "ports":
+            return lambda d: tuple(sorted(d.ports))
+        if field == "status":
+            return lambda d: (1 if d.is_new else 0,)
+        if field == "device_type":
+            return lambda d: sortutil.natural_key(type_label(d.device_type))
+        if field == "mac":
+            return lambda d: sortutil.natural_key(d.mac or "")
+        if field == "services":
+            return lambda d: sortutil.natural_key(", ".join(sorted(d.services)))
+        if field == "vendor":
+            return lambda d: sortutil.natural_key(d.vendor or "")
+        if field == "model":
+            return lambda d: sortutil.natural_key(d.model or "")
+        return lambda d: sortutil.natural_key(d.manufacturer or d.vendor or "")
 
     def add_device(self, device: Device) -> None:
         for row, existing in enumerate(self.devices):

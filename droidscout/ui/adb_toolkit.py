@@ -19,13 +19,14 @@ from PySide6.QtGui import QDesktopServices, QImage, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                                QFileDialog, QFormLayout, QFrame, QGridLayout,
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                               QMessageBox, QPlainTextEdit, QProgressDialog,
-                               QPushButton, QScrollArea, QSpinBox, QTabWidget,
-                               QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-                               QWidget)
+                               QMenu, QMessageBox, QPlainTextEdit,
+                               QProgressDialog, QPushButton, QScrollArea,
+                               QSpinBox, QTabWidget, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from .. import adb_actions, exporter, i18n, journal
+from .. import adb_actions, exporter, favorites, i18n, journal
 from .journal_dialog import JournalDialog
+from .sort_items import NaturalTreeItem
 from .theme import is_dark_theme
 
 RISK_COLORS = {"low": "#43a047", "medium": "#fb8c00",
@@ -125,6 +126,7 @@ class AdbToolkitDialog(QDialog):
         self._root_info = {}
         self._dev_loaded = False
         self._pdns_loaded = False
+        self.fav_apps = set(favorites.load(favorites.APPS_KEY))
 
         self.setWindowTitle(i18n.tr("toolkit_title", ip=self.ip))
         self.resize(760, 600)
@@ -786,6 +788,11 @@ class AdbToolkitDialog(QDialog):
         self.apps_refresh_btn = QPushButton(i18n.tr("apps_refresh"))
         self.apps_refresh_btn.clicked.connect(self.refresh_apps)
         top.addWidget(self.apps_refresh_btn)
+        self.apps_fav_btn = QPushButton(i18n.tr("fav_filter"))
+        self.apps_fav_btn.setCheckable(True)
+        self.apps_fav_btn.setToolTip(i18n.tr("fav_filter_hint"))
+        self.apps_fav_btn.toggled.connect(lambda *_: self._filter_apps())
+        top.addWidget(self.apps_fav_btn)
         top.addSpacing(12)
         top.addWidget(QLabel(i18n.tr("apps_search")))
         self.apps_search = QLineEdit()
@@ -802,6 +809,9 @@ class AdbToolkitDialog(QDialog):
                                         i18n.tr("apps_col_path")])
         self.apps_tree.setRootIsDecorated(False)
         self.apps_tree.setAlternatingRowColors(True)
+        self.apps_tree.setSortingEnabled(True)
+        self.apps_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.apps_tree.customContextMenuRequested.connect(self._apps_context_menu)
         self.apps_tree.header().resizeSection(0, 210)
         self.apps_tree.header().resizeSection(2, 90)
         self.apps_tree.itemDoubleClicked.connect(lambda *_: self._app_details())
@@ -846,23 +856,49 @@ class AdbToolkitDialog(QDialog):
         return text
 
     def _filter_apps(self, _text=""):
-        """Прячет строки, где поиск не встречается ни в одной колонке."""
+        """Прячет строки: не совпал поиск и/или не в избранном."""
         needle = self.apps_search.text().strip().lower()
+        fav_only = self.apps_fav_btn.isChecked()
         shown = 0
         total = self.apps_tree.topLevelItemCount()
         for index in range(total):
             item = self.apps_tree.topLevelItem(index)
-            match = not needle or any(
-                needle in (item.text(col) or "").lower()
-                for col in range(self.apps_tree.columnCount()))
+            package = item.data(0, Qt.UserRole) or ""
+            match = (not fav_only or package in self.fav_apps) and (
+                not needle or any(
+                    needle in (item.text(col) or "").lower()
+                    for col in range(self.apps_tree.columnCount())))
             item.setHidden(not match)
             shown += match
         if needle:
             self.status.setText(i18n.tr("apps_filter_found",
                                         shown=shown, total=total))
+        elif fav_only:
+            self.status.setText(i18n.tr("apps_fav_count_fmt", count=shown))
         elif getattr(self, "_apps_total", None) is not None:
             # поиск очищен — возвращаем статус последнего обновления списка
             self.status.setText(self._apps_status_text(self._apps_total))
+
+    def _apps_context_menu(self, pos):
+        """Правый клик по списку: добавить/убрать приложение из избранного."""
+        item = self.apps_tree.itemAt(pos)
+        package = (item.data(0, Qt.UserRole) or "") if item else ""
+        if not package:
+            return
+        menu = QMenu(self)
+        in_favs = package in self.fav_apps
+        action = menu.addAction(i18n.tr("fav_remove" if in_favs else "fav_add"))
+        if menu.exec(self.apps_tree.viewport().mapToGlobal(pos)) is not action:
+            return
+        if favorites.toggle(favorites.APPS_KEY, package):
+            self.fav_apps.add(package)
+        else:
+            self.fav_apps.discard(package)
+        item.setText(0, ("★ " if package in self.fav_apps else "") + package)
+        self.status.setText(i18n.tr(
+            "fav_added" if package in self.fav_apps else "fav_removed",
+            name=package))
+        self._filter_apps()
 
     def refresh_apps(self):
         kind = self.apps_kind.currentData() or "third"
@@ -883,9 +919,11 @@ class AdbToolkitDialog(QDialog):
             # version/path/origin пустые, если обогащение не добрало данных
             origin_key = origin_keys.get(app.get("origin", ""),
                                          "apps_origin_unknown")
-            item = QTreeWidgetItem([app["package"], app.get("version") or "",
+            package = app["package"]
+            starred = "★ " if package in self.fav_apps else ""
+            item = NaturalTreeItem([starred + package, app.get("version") or "",
                                     i18n.tr(origin_key), app.get("path", "")])
-            item.setData(0, Qt.UserRole, app["package"])
+            item.setData(0, Qt.UserRole, package)
             self.apps_tree.addTopLevelItem(item)
         self._apps_total = len(apps or [])
         self.status.setText(self._apps_status_text(self._apps_total))
@@ -1256,6 +1294,7 @@ class AdbToolkitDialog(QDialog):
                                          i18n.tr("files_col_date")])
         self.files_tree.setRootIsDecorated(False)
         self.files_tree.setAlternatingRowColors(True)
+        self.files_tree.setSortingEnabled(True)
         self.files_tree.header().resizeSection(0, 280)
         self.files_tree.header().resizeSection(1, 110)
         self.files_tree.header().resizeSection(2, 80)
@@ -1302,15 +1341,18 @@ class AdbToolkitDialog(QDialog):
                               i18n.tr("apk_paths_col_free")])
         tree.setRootIsDecorated(False)
         tree.setAlternatingRowColors(True)
+        tree.setSortingEnabled(True)
         tree.header().resizeSection(0, 290)
         tree.header().resizeSection(1, 240)
         for target in targets or []:
             free = target.get("free_bytes")
-            item = QTreeWidgetItem([
+            item = NaturalTreeItem([
                 target.get("path", ""),
                 i18n.tr("apk_paths_" + target.get("tier", "no")),
                 _human_mb(free) if free is not None else "—"])
             item.setData(0, Qt.UserRole, target.get("path", ""))
+            if free is not None:
+                item.setData(2, Qt.UserRole, free)   # числовая сортировка
             tree.addTopLevelItem(item)
         lay.addWidget(tree, 1)
 
@@ -1351,23 +1393,63 @@ class AdbToolkitDialog(QDialog):
 
     def _on_files(self, listing, exc):
         self.files_refresh_btn.setEnabled(True)
-        if exc:
-            self._failed(exc)
+        if exc is not None:
+            self._files_fallback(exc)
             return
         self._idle()
+        self._show_files(listing)
+
+    def _show_files(self, listing, requested=""):
+        """Заполняет таблицу файлов и пишет статус (с учётом перехода)."""
         self.files_tree.clear()
         entries = (listing or {}).get("entries", [])
         for entry in entries:
             label = entry["name"] + (f" -> {entry['target']}"
                                      if entry.get("target") else "")
-            item = QTreeWidgetItem([label, entry.get("perms", ""),
+            item = NaturalTreeItem([label, entry.get("perms", ""),
                                     entry.get("size", ""),
                                     entry.get("date", "")])
             item.setData(0, Qt.UserRole, entry)
             self.files_tree.addTopLevelItem(item)
-        self.status.setText(i18n.tr("files_listed",
-                                    path=(listing or {}).get("path", ""),
-                                    count=len(entries)))
+        actual = (listing or {}).get("path", "")
+        if requested and actual and \
+                requested.rstrip("/") != actual.rstrip("/"):
+            self.status.setText(i18n.tr("files_fallback",
+                                        requested=requested, path=actual))
+        else:
+            self.status.setText(i18n.tr("files_listed", path=actual,
+                                        count=len(entries)))
+
+    def _files_fallback(self, exc):
+        """«denied» на /storage/* — авто-переход на /sdcard и псевдонимы.
+
+        На ТВ-боксах сам каталог /storage/emulated часто читает только
+        root, а /storage/emulated/0 и /sdcard работают. Петли нет:
+        list_dir_any обслуживается отдельным обработчиком, который при
+        неудаче сразу показывает исходную подсказку про root.
+        """
+        if getattr(exc, "code", "") != "denied":
+            self._failed(exc)
+            return
+        requested = self.files_path.text().strip() or "/"
+        alts = adb_actions.storage_alternates(requested)
+        if not alts:
+            self._failed(exc)
+            return
+        self._busy("files_fallback_busy")
+        self._run(self._on_files_alts(requested), adb_actions.list_dir_any,
+                  self.ip, alts, requested=requested)
+
+    def _on_files_alts(self, requested):
+        def handler(listing, exc):
+            if exc is not None:
+                self._failed(exc)     # ни один псевдоним не открыт
+                return
+            self._idle()
+            actual = (listing or {}).get("path") or requested
+            self.files_path.setText(actual)
+            self._show_files(listing, requested=requested)
+        return handler
 
     def _files_goto(self, path: str):
         self.files_path.setText(path or "/")
