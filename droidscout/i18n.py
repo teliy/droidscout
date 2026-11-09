@@ -177,8 +177,9 @@ STRINGS = {
         "ds_repl_fail": "REPL-опрос не удался: {err}",
         "ds_repl_facts": "Что выяснили:",
         "ds_repl_pseudo": ("Это не MicroPython: консоль отвергает import/exec "
-                           "(ответ «Bad command …»). Посланы простые пробы "
-                           "(help, ?, version, …) — ответы в транскрипте."),
+                           "(ответ «Bad command …»). Вместо исходников посланы "
+                           "читающие пробы типовых команд (help, ver, get, …) — "
+                           "принятые ответы в транскрипте."),
         "ds_repl_evidence": "REPL-опрос: {info}",
         "det_seen": "Обнаружено",
         "det_evidence": "Признаки",
@@ -502,8 +503,9 @@ STRINGS = {
         "ds_repl_fail": "REPL interview failed: {err}",
         "ds_repl_facts": "Findings:",
         "ds_repl_pseudo": ("Not MicroPython: the console rejects import/exec "
-                           "(\"Bad command ...\"). Simple probes were sent "
-                           "(help, ?, version, ...) — see the transcript."),
+                           "(\"Bad command ...\"). Read-only probes of common "
+                           "commands were sent instead (help, ver, get, ...) — "
+                           "accepted replies are in the transcript."),
         "ds_repl_evidence": "REPL interview: {info}",
         "det_seen": "Seen at",
         "det_evidence": "Evidence",

@@ -18,9 +18,10 @@ exec("try: ... except: print(error)") — исключение на устрой
 Псевдо-REPL: некоторые модули (например, Shenzhen iComm на tcp/14035) рисуют
 приглашение '>>> ', но исходники отвергают строкой «Bad command import.» —
 это фирменный интерпретатор с лимитированным набором команд, а не MicroPython.
-Первый вопрос служит разведкой: получив «Bad command …», опрос немедленно
-бросает MicroPython-сценарий и шлёт простые однотокеновые пробы (help, ?,
-version, …) — их полезные ответы попадают в факт «Console: …».
+Первый вопрос служит разведкой: получив «Bad command …», опрос бросает
+MicroPython-сценарий и ищет живые команды консоли — сначала явные пробы
+(help, ?, version, …), затем словарь типовых однотокеновых команд (get, show,
+ifconfig, at+gmr, …); их ответы попадают в факт «Console: …».
 
 Модуль не зависит от Qt и покрыт тестами scripts/test_repl_probe.py.
 """
@@ -103,6 +104,20 @@ REPL_QUESTIONS: List[Tuple[str, str]] = [
 # Псевдо-REPL: вместо 8 исходников шлём короткие однотокеновые пробы —
 # только чтение; худший ответ — «Bad command …», сессию это не рвёт.
 PSEUDO_PROBES: Tuple[str, ...] = ("help", "?", "version", "ver", "info", "status")
+
+# Словарь типовых команд фирменных консолей (только чтение, без аргументов):
+# без аргументов почти всё отвечает usage-подсказкой — из неё видно синтаксис.
+# Пишущих команд (set/write/reset/upgrade/erase/exit) здесь нет и не будет.
+PSEUDO_DICT: Tuple[str, ...] = (
+    "sysinfo", "system", "usage", "man", "show", "get", "dump", "list", "read",
+    "ip", "mac", "wifi", "wlan", "net", "ifconfig", "iwconfig", "netstat", "arp",
+    "mem", "free", "ram", "flash", "df", "ps", "top", "uptime", "date", "time",
+    "sn", "uuid", "id", "chip", "hw", "cpu", "temp", "bat", "battery",
+    "gpio", "adc", "pwm", "pin", "key", "button", "sensor",
+    "ls", "dir", "cat", "env", "cfg", "config", "boot", "log", "debug", "test",
+    "at", "at+gmr", "at+version", "at+gmac", "at+csq", "echo", "print",
+)
+
 _BAD_COMMAND_RE = re.compile(r"bad command", re.I)
 
 _MARKER_RE = re.compile(r"^DS_([A-Z]+)[:,]?\s?(.*)$")
@@ -138,6 +153,23 @@ def _pseudo_notes(text: str) -> str:
             continue
         keep.append(s)
     return "\n".join(keep)[:600]
+
+
+def _pseudo_report(live: List[Tuple[str, str]], text: str) -> str:
+    """Сводка псевдо-REPL: «команда: ответ» живых проб.
+
+    Если живых команд нет — полезные строки баннера (_pseudo_notes), иначе ''.
+    """
+    lines: List[str] = []
+    for cmd, reply in live:
+        body = " / ".join(s.strip()
+                          for s in reply.replace(">>> ", "\n").splitlines()
+                          if s.strip())
+        body = _BAD_COMMAND_RE.sub("", body).strip()[:100]
+        lines.append(f"{cmd}: {body}" if body else cmd)
+    if lines:
+        return "\n".join(lines)[:600]
+    return _pseudo_notes(text)
 
 
 def _ends_with_prompt(buf: bytes) -> bool:
@@ -219,7 +251,13 @@ def interview(ip: str, port: int, *, cmd_wait: float = 2.5,
         else:
             parts.append(resp)
             if _BAD_COMMAND_RE.search(resp.decode("utf-8", "replace")):
+                # псевдо-REPL: фирменная консоль с собственным словарём команд.
+                # Волна 1 — явные пробы (весь обмен в транскрипт); волна 2 —
+                # словарь типовых команд (в транскрипт только принятые ответы,
+                # иначе 60 строк «Bad command …» засорят панель).
                 result["pseudo"] = True
+                live: List[Tuple[str, str]] = []
+                result["pseudo_live"] = live
                 wait = min(cmd_wait, 1.5)
                 for probe in PSEUDO_PROBES:
                     if stop() or time.monotonic() - started > overall:
@@ -228,7 +266,26 @@ def interview(ip: str, port: int, *, cmd_wait: float = 2.5,
                     if resp is None:
                         result["error"] = "send failed"
                         break
+                    rtxt = resp.decode("utf-8", "replace")
                     parts.append(resp)
+                    if not _BAD_COMMAND_RE.search(rtxt):
+                        live.append((probe, rtxt))
+                sent = 0
+                if not result["error"]:
+                    for probe in PSEUDO_DICT:
+                        if stop() or time.monotonic() - started > overall:
+                            break
+                        resp = _ask(sock, probe, wait, stop)
+                        if resp is None:
+                            result["error"] = "send failed"
+                            break
+                        rtxt = resp.decode("utf-8", "replace")
+                        sent += 1
+                        if not _BAD_COMMAND_RE.search(rtxt):
+                            parts.append(resp)
+                            live.append((probe, rtxt))
+                if not live and sent:
+                    result["pseudo_dict"] = f"{sent} probed, all rejected"
             else:
                 for _key, cmd in REPL_QUESTIONS[1:]:
                     if stop() or time.monotonic() - started > overall:
@@ -249,8 +306,11 @@ def interview(ip: str, port: int, *, cmd_wait: float = 2.5,
     result["transcript"] = text[:16384]
     result["answers"] = parse_transcript(text)
     if result.get("pseudo"):
-        # фактов DS_ не будет — вместо них полезные строки простых проб
-        result["answers"]["pseudo"] = _pseudo_notes(text)
+        # фактов DS_ не будет — вместо них сводка живых команд псевдо-консоли
+        live = result.pop("pseudo_live", [])
+        result["answers"]["pseudo"] = _pseudo_report(live, text)
+        if result.get("pseudo_dict"):
+            result["answers"]["pseudo_dict"] = result.pop("pseudo_dict")
     result["ok"] = bool(result["answers"])
     if not result["ok"] and not result["error"]:
         result["error"] = "no answers"      # понятнее, чем «?» в панели
@@ -388,6 +448,11 @@ def bullets(answers: Dict[str, str]) -> List[str]:
             notes = answers["pseudo"].strip()
             first = " · ".join(notes.splitlines()[:4])[:120] if notes else ""
             out.append("Console: " + (first or "rejects import/exec"))
+    except (KeyError, ValueError):
+        pass
+    try:
+        if answers.get("pseudo_dict"):
+            out.append(f"Console dict: {answers['pseudo_dict']}")
     except (KeyError, ValueError):
         pass
     return out
