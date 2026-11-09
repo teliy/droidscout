@@ -27,6 +27,9 @@ TMP_DIR = "/data/local/tmp"
 SHOT_PATH = TMP_DIR + "/droidscout_shot.png"
 APK_PATH = TMP_DIR + "/droidscout_install.apk"
 
+PING_CMD = "echo ok"                 # быстрый «жив ли adbd» после простоя
+DF_DATA_CMD = "df -k -P /data 2>/dev/null"   # свободное место перед установкой
+
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 # Android-ключи для «пульта» (см. android.view.KeyEvent)
@@ -573,8 +576,58 @@ def app_action(host: str, package: str, action: str, port: int = 5555,
     return shell(host, template.format(pkg=shlex_quote(package)), port, timeout)
 
 
+def _device_alive(device: AdbDevice, addr: str, timeout: float) -> bool:
+    """Быстрый «ping» по adb: отвечает ли adbd вообще.
+
+    После долгого простоя приставка может уснуть (Wi-Fi в режиме экономии
+    энергии) — TCP-подключение при этом устанавливается, но adbd не
+    обрабатывает команды, и первый же запрос висит до тайм-аута. Короткий
+    'echo ok' (до 10 с) выявляет это до многосекундной передачи APK.
+    """
+    try:
+        device.shell(PING_CMD, timeout=min(10.0, timeout))
+    except (AdbError, AdbTimeout, OSError) as exc:
+        journal.event(addr, f"ping не прошёл: {exc}")
+        return False
+    journal.event(addr, "ping ok")
+    return True
+
+
+def _cleanup_tmp(device: AdbDevice, addr: str) -> None:
+    """Удаляет временный APK с устройства (после ошибки/отмены).
+
+    Упавший pm install оставляет десятки мегабайт в /data/local/tmp
+    (команда '&& rm -f' выполняется только при успехе): память приставки
+    и так забита — следующая попытка упрётся в нехватку места ещё до
+    установки и завершится тайм-аутом «по непонятной причине».
+    """
+    try:
+        device.shell(f"rm -f {APK_PATH}", timeout=10)
+        journal.event(addr, "временный APK удалён с устройства")
+    except (AdbError, AdbTimeout, OSError):
+        journal.event(addr, "rm -f не прошёл — устройство недоступно")
+
+
+def parse_df_available(text: str) -> "int | None":
+    """Вывод 'df -k -P <путь>' -> сколько байт доступно, или None.
+
+    POSIX-таблица: Filesystem 1024-blocks Used Available Capacity
+    Mounted on. Разбираем только строки с числовым вторым полем —
+    заголовок и кривой вывод пропускаются, None означает «не узнали»
+    (тогда проверка места просто пропускается).
+    """
+    for line in (text or "").splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and fields[1].isdigit():
+            try:
+                return int(fields[3]) * 1024
+            except ValueError:
+                continue
+    return None
+
+
 def install_apk(host: str, apk_path: str, port: int = 5555,
-                timeout: float = 300.0,
+                timeout: float = 600.0,
                 progress: "Callable[[int, int], None] | None" = None,
                 should_stop: "Callable[[], bool] | None" = None) -> str:
     """Локальный APK -> устройство (sync push) -> 'pm install -r'.
@@ -584,6 +637,17 @@ def install_apk(host: str, apk_path: str, port: int = 5555,
     (в UI это переключение на этап pm install). should_stop() — проверка
     отмены: до старта и между чанками; отменённая операция ->
     ActionError с кодом 'cancel'.
+
+    Порядок: 1) ping-пробуждение с переподключением — после долгого
+    простоя adbd часто молчит; 2) проверка места на /data — нехватка
+    должна быть видна до передачи, а не тайм-аутом; 3) передача с
+    прогрессом; 4) pm install с щедрым тайм-аутом.
+
+    Коды ошибок: 'wake' (приставка не отвечает даже на ping), 'space'
+    (недостаточно места, в сообщении цифры), 'timeout' (в сообщении —
+    этап: 'push APK' или 'pm install'), 'pm' (отказ pm, в сообщении —
+    ответ устройства), 'cancel', 'conn'. При любой ошибке/отмене
+    временный APK с устройства удаляется.
     """
     try:
         with open(apk_path, "rb") as f:
@@ -594,29 +658,187 @@ def install_apk(host: str, apk_path: str, port: int = 5555,
         raise ActionError("empty apk", "")
     if should_stop is not None and should_stop():
         raise ActionError("cancelled", "cancel")
+    addr = f"{host}:{port}"
     device = _open(host, port, max(timeout, 30.0))
     try:
-        journal.event(f"{host}:{port}", f"push APK: {len(data)} B -> {APK_PATH}")
-        device.push_bytes(data, APK_PATH, timeout=timeout,
-                          progress=progress, should_stop=should_stop)
-        journal.event(f"{host}:{port}", "push ok — запускаю pm install")
+        # 1. Пробуждение: первый ping не прошёл — переподключаемся и
+        # пробуем ещё раз (часто достаточно одной попытки).
+        if not _device_alive(device, addr, timeout):
+            device.close()
+            device = _open(host, port, max(timeout, 30.0))
+            if not _device_alive(device, addr, timeout):
+                raise ActionError("device did not answer echo ping", "wake")
+        # 2. Место: временная копия + копия pm install ≈ 2×APK (+1 МБ).
+        try:
+            free = parse_df_available(device.shell(DF_DATA_CMD, timeout=15))
+        except (AdbError, AdbTimeout, OSError) as exc:
+            journal.event(addr, f"df /data не прошёл: {exc}")
+            free = None
+        if free is not None:
+            need = int(len(data) * 2.1) + 1_048_576
+            journal.event(addr,
+                          f"df /data: свободно {free} B, нужно ≈{need} B")
+            if free < need:
+                raise ActionError(f"free {free} B, need {need} B", "space")
+        # 3. Передача.
+        journal.event(addr, f"push APK: {len(data)} B -> {APK_PATH}")
+        started = time.monotonic()
+        try:
+            device.push_bytes(data, APK_PATH, timeout=timeout,
+                              progress=progress, should_stop=should_stop)
+        except ActionError:
+            raise
+        except (AdbError, AdbTimeout, OSError) as exc:
+            _cleanup_tmp(device, addr)
+            if isinstance(exc, AdbTimeout):
+                raise ActionError("push APK", "timeout") from exc
+            code = "cancel" if "cancel" in str(exc).lower() else "conn"
+            raise ActionError(str(exc), code) from exc
+        seconds = time.monotonic() - started
+        journal.event(addr, f"push ok за {seconds:.1f}s "
+                            f"({len(data) / max(seconds, 0.001) / 1048576:.1f} МБ/с)"
+                            " — запускаю pm install")
+        # 4. Установка.
         if should_stop is not None and should_stop():
+            _cleanup_tmp(device, addr)
             raise ActionError("cancelled", "cancel")
-        output = device.shell(f"pm install -r {APK_PATH} && rm -f {APK_PATH}",
-                              timeout=timeout)
-        journal.event(f"{host}:{port}",
-                      f"pm install: {(output or '').strip()[:120] or 'ok'}")
-        return output.strip()
-    except (AdbError, AdbTimeout, OSError) as exc:
-        code = "cancel" if "cancel" in str(exc).lower() else "conn"
-        raise ActionError(str(exc), code) from exc
+        try:
+            output = device.shell(
+                f"pm install -r {APK_PATH} && rm -f {APK_PATH}",
+                timeout=timeout)
+        except (AdbError, AdbTimeout, OSError) as exc:
+            _cleanup_tmp(device, addr)
+            if isinstance(exc, AdbTimeout):
+                raise ActionError("pm install", "timeout") from exc
+            raise ActionError(str(exc), "conn") from exc
+        text = (output or "").strip()
+        journal.event(addr, f"pm install: {text[:120] or 'ok'}")
+        if "Failure" in text:
+            # pm отказал, но '&& rm -f' tmp-копию не выполнил — чистим.
+            _cleanup_tmp(device, addr)
+            raise ActionError(text[:200], "pm")
+        return text
     finally:
         device.close()
 
 
+# ------------------------------------------------- пути для закачки APK
+APK_SCAN_PATHS = ("/sdcard/Download", "/storage/emulated/0/Download",
+                  "/sdcard", "/storage/emulated/0", "/data/local/tmp")
+PROBE_NAME = ".droidscout_probe"
+
+
+def _scan_command(paths=APK_SCAN_PATHS) -> str:
+    """Одна shell-команда, опрашивающая все каталоги-кандидаты сразу.
+
+    Для каждого пути: тип (каталог/файл/нет), запись реальной пробой
+    touch+rm (не верим «-w» на кривых FUSE-правах), попытка создать
+    отсутствующий Download и свободное место ('df -k -P'). Ответы —
+    с маркерами ==P, разбор в parse_scan_output. Один сеанс shell
+    вместо 2-3 запросов на каждый путь.
+    """
+    parts = []
+    for p in paths:
+        q = shlex_quote(p)
+        parts.append(
+            f"p={q}; t=N; [ -d \"$p\" ] && t=D; "
+            f"[ -e \"$p\" ] && [ \"$t\" = N ] && t=F; "
+            "[ \"$t\" = N ] && mkdir -p \"$p\" 2>/dev/null && t=D; "
+            f"w=0; touch \"$p/{PROBE_NAME}\" 2>/dev/null"
+            f" && rm -f \"$p/{PROBE_NAME}\" && w=1; "
+            "echo \"==P $p\"; echo \"T$t W$w\";"
+            " df -k -P \"$p\" 2>/dev/null | tail -n +2")
+    return "; ".join(parts) + "; echo ==END"
+
+
+def parse_scan_output(text: str) -> "list[dict]":
+    """Вывод _scan_command -> [{path, kind, writable, free_bytes}].
+
+    kind: 'dir' | 'file' | 'missing'. free_bytes — из первого df-ответа
+    после маркера (None, если df молчал). Строки без маркера до первого
+    ==P игнорируются — прошивки любят дописывать motd.
+    """
+    targets: "list[dict]" = []
+    current = None
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line.startswith("==P "):
+            current = {"path": line[4:].strip(), "kind": "missing",
+                       "writable": False, "free_bytes": None}
+            targets.append(current)
+            continue
+        if current is None or line.startswith("=="):
+            continue
+        flag = re.match(r"^T([DFN])\s+W([01])$", line)
+        if flag:
+            current["kind"] = {"D": "dir", "F": "file",
+                               "N": "missing"}[flag.group(1)]
+            current["writable"] = flag.group(2) == "1"
+            continue
+        fields = line.split()
+        if (len(fields) >= 4 and fields[1].isdigit()
+                and current["free_bytes"] is None):
+            try:
+                current["free_bytes"] = int(fields[3]) * 1024
+            except ValueError:
+                pass
+    return targets
+
+
+TIER_ORDER = ("rec", "ok", "svc", "taken", "no")
+
+
+def rank_apk_targets(targets: "list[dict]") -> "list[dict]":
+    """Присваивает каждому пути tier и сортирует от лучшего к худшему.
+
+    rec   — каталог …/Download, доступный на запись: его видит
+            файл-менеджер приставки, установка прямо с устройства;
+    ok    — корень пользовательского хранилища (/sdcard и т.п.);
+    svc   — служебные каталоги (/data/local/tmp): adb их видит,
+            а файл-менеджер приставки — нет;
+    taken — путь существует, но это файл;
+    no    — недоступно/не создалось.
+    """
+    for t in targets:
+        low = (t["path"].rstrip("/")).lower()
+        if t["kind"] == "dir" and t["writable"] and low.endswith("/download"):
+            t["tier"] = "rec"
+        elif (t["kind"] == "dir" and t["writable"]
+              and "/data/local/tmp" not in low):
+            t["tier"] = "ok"
+        elif t["kind"] == "dir" and t["writable"]:
+            t["tier"] = "svc"
+        elif t["kind"] == "file":
+            t["tier"] = "taken"
+        else:
+            t["tier"] = "no"
+    targets.sort(key=lambda t: (TIER_ORDER.index(t["tier"]), t["path"]))
+    return targets
+
+
+def scan_apk_targets(host: str, port: int = 5555,
+                     timeout: float = 25.0) -> "list[dict]":
+    """Скан файловой системы: куда на приставке класть APK.
+
+    Возвращает ранжированный список целей (см. rank_apk_targets):
+    путь, тип, доступность на запись, свободное место. Одна batch-команда
+    — на пять путей уходит один сеанс shell.
+    """
+    addr = f"{host}:{port}"
+    started = time.monotonic()
+    text = shell(host, _scan_command(), port, timeout)
+    targets = parse_scan_output(text)
+    if not targets:
+        raise ActionError("scan: empty answer", "conn")
+    rank_apk_targets(targets)
+    journal.event(addr, f"скан путей APK: {len(targets)} целей, "
+                        f"{time.monotonic() - started:.1f}s")
+    return targets
+
+
 # ---------------------------------------------------------------- файлы
 def push_file(host: str, local_path: str, remote_dir: str,
-              port: int = 5555, timeout: float = 300.0,
+              port: int = 5555, timeout: float = 600.0,
               progress: "Callable[[int, int], None] | None" = None,
               should_stop: "Callable[[], bool] | None" = None) -> str:
     """Локальный файл с ПК -> устройство (sync SEND). Возвращает удалённый путь.

@@ -66,6 +66,14 @@ def _friendly_error(exc: Exception, ip: str) -> str:
             return i18n.tr("adb_unauthorized")
         if exc.code == "cancel":
             return i18n.tr("err_cancelled")
+        if exc.code == "wake":
+            return i18n.tr("err_wake")
+        if exc.code == "space":
+            return i18n.tr("err_space", details=str(exc))
+        if exc.code == "timeout":
+            return i18n.tr("err_timeout", stage=str(exc))
+        if exc.code == "pm":
+            return i18n.tr("err_pm", output=str(exc))
         if exc.code == "conn":
             key = "adb_conn_protocol" if _PROTO_ERR_RE.search(str(exc)) else "adb_conn"
             return i18n.tr(key, ip=ip, port=5555, error=str(exc)[:150])
@@ -1261,9 +1269,75 @@ class AdbToolkitDialog(QDialog):
         self.files_upload_btn = QPushButton(i18n.tr("files_upload"))
         self.files_upload_btn.clicked.connect(self._file_upload)
         actions.addWidget(self.files_upload_btn)
+        self.apk_paths_btn = QPushButton(i18n.tr("apk_paths_btn"))
+        self.apk_paths_btn.clicked.connect(self._apk_paths)
+        actions.addWidget(self.apk_paths_btn)
         actions.addStretch(1)
         layout.addLayout(actions)
         return page
+
+    def _apk_paths(self):
+        """«Куда закачать APK?» — скан ФС и диалог с рекомендациями."""
+        self.apk_paths_btn.setEnabled(False)
+        self._busy("apk_paths_busy")
+        self._run(self._on_apk_paths, adb_actions.scan_apk_targets, self.ip)
+
+    def _on_apk_paths(self, targets, exc):
+        self.apk_paths_btn.setEnabled(True)
+        if exc:
+            self._failed(exc)
+            return
+        self._idle()
+        dlg = QDialog(self)
+        dlg.setWindowTitle(i18n.tr("apk_paths_title"))
+        dlg.resize(640, 400)
+        lay = QVBoxLayout(dlg)
+        hint = QLabel(i18n.tr("apk_paths_hint"))
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        tree = QTreeWidget()
+        tree.setHeaderLabels([i18n.tr("apk_paths_col_path"),
+                              i18n.tr("apk_paths_col_status"),
+                              i18n.tr("apk_paths_col_free")])
+        tree.setRootIsDecorated(False)
+        tree.setAlternatingRowColors(True)
+        tree.header().resizeSection(0, 290)
+        tree.header().resizeSection(1, 240)
+        for target in targets or []:
+            free = target.get("free_bytes")
+            item = QTreeWidgetItem([
+                target.get("path", ""),
+                i18n.tr("apk_paths_" + target.get("tier", "no")),
+                _human_mb(free) if free is not None else "—"])
+            item.setData(0, Qt.UserRole, target.get("path", ""))
+            tree.addTopLevelItem(item)
+        lay.addWidget(tree, 1)
+
+        row = QHBoxLayout()
+        pick_btn = QPushButton(i18n.tr("apk_paths_pick"))
+        pick_btn.setEnabled(False)
+        pick_btn.clicked.connect(lambda: self._use_apk_path(dlg, tree))
+        row.addWidget(pick_btn)
+        row.addStretch(1)
+        close_btn = QPushButton(i18n.tr("close"))
+        close_btn.clicked.connect(dlg.reject)
+        row.addWidget(close_btn)
+        lay.addLayout(row)
+
+        def _selection_changed(*_args):
+            pick_btn.setEnabled(tree.currentItem() is not None)
+
+        tree.currentItemChanged.connect(_selection_changed)
+        tree.itemDoubleClicked.connect(lambda *_a: self._use_apk_path(dlg, tree))
+        dlg.exec()
+
+    def _use_apk_path(self, dlg, tree):
+        item = tree.currentItem()
+        if not item:
+            return
+        dlg.accept()
+        self._files_goto(item.data(0, Qt.UserRole) or "/")
 
     def _files_join(self, name: str) -> str:
         base = self.files_path.text().strip() or "/"
