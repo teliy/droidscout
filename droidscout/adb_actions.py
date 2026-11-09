@@ -228,8 +228,20 @@ def parse_dumpsys_all(text: str) -> "dict[str, dict]":
     return out
 
 
+def _origin_from_path(path: str) -> str:
+    """Путь APK/кода -> происхождение: 'third' (/data), 'system'
+    (/system|/product|/vendor|/odm|/apex), иначе '' (неизвестно)."""
+    p = path or ""
+    if p.startswith("/data"):
+        return "third"
+    if p.startswith(("/system", "/product", "/vendor", "/odm", "/apex")):
+        return "system"
+    return ""
+
+
 def _enrich_apps(host: str, port: int, timeout: float, apps: "list[dict]",
-                 kind_flag: str, failed: "set[str]", ok_command: str = "") -> None:
+                 kind_flag: str, failed: "set[str]", ok_command: str = "",
+                 want_details: bool = False) -> None:
     """Добирает пути APK и версии, которых не было в базовом списке.
 
     До трёх шагов, каждый — под журналом; ошибка любого шага (кривой pm,
@@ -239,6 +251,11 @@ def _enrich_apps(host: str, port: int, timeout: float, apps: "list[dict]",
       1. `pm list packages -f <kind> --show-versioncode` — пути и версии;
       2. `pm list packages -f <kind>`                    — пути;
       3. `dumpsys package` одним куском                  — версии.
+
+    want_details=True (выгрузка для ИИ): шаг 3 выполняется всегда — из
+    dumpsys, кроме версий, добираются versionCode, minSdk/targetSdk,
+    даты установки/обновления и разрешения; кодPath закрывает и путь,
+    и происхождение, если pm не дал -f.
 
     ok_command — базовая команда, уже вернувшая список: шаг 2 не станет
     повторять её (тот же вывод новой информации не даст), failed — набор
@@ -293,7 +310,7 @@ def _enrich_apps(host: str, port: int, timeout: float, apps: "list[dict]",
     # 3) версии: полный dumpsys package одним запросом — медленнее и
     #    «толще», зато работает даже там, где pm не знает ни -f, ни
     #    --show-versioncode. Заодно закрывает codePath, если пути нет.
-    if missing("version") or missing("path"):
+    if want_details or missing("version") or missing("path"):
         try:
             text = shell(host, "dumpsys package", port, timeout)
             infos = parse_dumpsys_all(text)
@@ -308,6 +325,14 @@ def _enrich_apps(host: str, port: int, timeout: float, apps: "list[dict]",
                 if info.get("path") and not app.get("path"):
                     app["path"] = info["path"]
                     filled += 1
+                if want_details:
+                    for key in ("code", "min_sdk", "target_sdk",
+                                "installed", "updated"):
+                        if info.get(key):
+                            app[key] = info[key]
+                    app["permissions"] = info.get("permissions", [])
+                    if info.get("path") and not app.get("origin"):
+                        app["origin"] = _origin_from_path(info["path"])
             journal.event(f"{host}:{port}",
                           f"dumpsys package: секций {len(infos)}, "
                           f"заполнено полей {filled}")
@@ -316,8 +341,10 @@ def _enrich_apps(host: str, port: int, timeout: float, apps: "list[dict]",
 
 
 def list_apps(host: str, kind: str = "third", port: int = 5555,
-              timeout: float = 20.0) -> "list[dict]":
-    """Список пакетов: {package, path, version}. kind: 'third' (-3), 'system' (-s), 'all'.
+              timeout: float = 20.0, detailed: bool = False) -> "list[dict]":
+    """Список пакетов: {package, path, version, origin}. kind: 'third' (-3),
+    'system' (-s), 'all'. detailed=True добавляет code/min_sdk/target_sdk/
+    installed/updated/permissions (полный dumpsys всегда).
 
     На части прошивок `pm` отвергает флаги (-f/-3/-s) или молча отдаёт
     пустоту на комбинацию, которая работает в консоли пользователя.
@@ -332,6 +359,9 @@ def list_apps(host: str, kind: str = "third", port: int = 5555,
     а колонки «Версия» и «APK» остаются пустыми — их добирает
     _enrich_apps: -f с --show-versioncode, затем голый -f, затем полный
     dumpsys package. Любая ошибка обогащения не роняет список.
+
+    origin: 'third'/'system' — по вкладке, а для 'all' — по пути APK или
+    codePath из dumpsys; если путь неизвестен, остаётся ''.
     """
     chains = {
         "third": ("-3", "-f -3", "-f"),
@@ -365,14 +395,64 @@ def list_apps(host: str, kind: str = "third", port: int = 5555,
     if not apps:
         return []
     _enrich_apps(host, port, timeout, apps, variants[0], failed,
-                 ok_command=command)
+                 ok_command=command, want_details=detailed)
+    # Происхождение: во вкладках third/system оно задано самим фильтром,
+    # в «Все» — определяется по пути (если путь так и не нашёлся — '').
+    for app in apps:
+        app["origin"] = kind if kind in ("third", "system") \
+            else _origin_from_path(app.get("path", ""))
     apps.sort(key=lambda item: item["package"].lower())
     return apps
 
 
+def collect_apps(host: str, port: int = 5555, timeout: float = 30.0) -> "list[dict]":
+    """Полная выгрузка всех пакетов для передачи в ИИ (оценка нужности/
+    безопасности). Каждая запись: package, origin (system/third), version,
+    code, min_sdk, target_sdk, enabled (yes/no/'' — неизвестно), path,
+    installed, updated, permissions[].
+
+    origin сверяется со списком системных (`pm list packages -s`): это
+    надёжнее, чем путь, — прошивка может положить «стороннее» куда
+    угодно. Отключённые помечаются по `pm list packages -d`. Если pm не
+    знает -s/-d (нет строки 'package:' в ответе) — остаётся значение по
+    пути/'' — честно, без догадок.
+    """
+    apps = list_apps(host, "all", port, timeout, detailed=True)
+    if not apps:
+        return []
+    index = {app["package"]: app for app in apps}
+
+    def flag_set(command: str) -> "tuple[set, bool]":
+        # (множество имён, можно ли доверять ответу: в нём есть 'package:')
+        try:
+            text = shell(host, command, port, timeout)
+        except ActionError:
+            journal.event(f"{host}:{port}", f"{command}: недоступен")
+            return set(), False
+        names = {name for name, _p, _v in parse_pm_list(text)}
+        return names, bool(names) or "package:" in (text or "")
+
+    system_set, trusted = flag_set("pm list packages -s")
+    if trusted:
+        for name, app in index.items():
+            app["origin"] = "system" if name in system_set else "third"
+        journal.event(f"{host}:{port}",
+                      f"классификация -s: системных {len(system_set & set(index))} "
+                      f"из {len(index)}")
+    disabled_set, trusted = flag_set("pm list packages -d")
+    if trusted:
+        for name, app in index.items():
+            app["enabled"] = "no" if name in disabled_set else "yes"
+        journal.event(f"{host}:{port}",
+                      f"классификация -d: отключённых {len(disabled_set & set(index))}")
+    return apps
+
+
 def parse_dumpsys_package(text: str) -> dict:
-    """Вывод 'dumpsys package <pkg>' -> {version, code, installed, updated,
-    target_sdk, path}."""
+    """Вывод 'dumpsys package <pkg>' -> {version, code, min_sdk, target_sdk,
+    installed, updated, path, permissions}. permissions — упорядоченный
+    список без повторов (requested/install/runtime сливаются — для оценки
+    безопасности это неважно, набор тот же)."""
     out = {}
     match = re.search(r"versionName=(\S+)", text)
     if match:
@@ -380,18 +460,29 @@ def parse_dumpsys_package(text: str) -> dict:
     match = re.search(r"versionCode=(\d+)", text)
     if match:
         out["code"] = match.group(1)
+    match = re.search(r"\bminSdk=(\d+)", text)
+    if match:
+        out["min_sdk"] = match.group(1)
+    match = re.search(r"targetSdk=(\d+)", text)
+    if match:
+        out["target_sdk"] = match.group(1)
     match = re.search(r"firstInstallTime=(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)", text)
     if match:
         out["installed"] = match.group(1)
     match = re.search(r"lastUpdateTime=(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)", text)
     if match:
         out["updated"] = match.group(1)
-    match = re.search(r"targetSdk=(\d+)", text)
-    if match:
-        out["target_sdk"] = match.group(1)
     match = re.search(r"codePath=(/\S+)", text)
     if match:
         out["path"] = match.group(1)
+    permissions = []
+    for match in re.finditer(r"[\w.]+\.permission\.[A-Za-z0-9_]+", text or ""):
+        perm = match.group(0)
+        if perm not in permissions:
+            permissions.append(perm)
+        if len(permissions) >= 200:      # на всякий случай — куча не нужна
+            break
+    out["permissions"] = permissions
     return out
 
 

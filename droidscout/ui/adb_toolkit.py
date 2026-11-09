@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QFileDialog, QFormLayout,
                                QPushButton, QSpinBox, QTabWidget, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from .. import adb_actions, i18n, journal
+from .. import adb_actions, exporter, i18n, journal
 from .journal_dialog import JournalDialog
 from .theme import is_dark_theme
 
@@ -483,16 +483,24 @@ class AdbToolkitDialog(QDialog):
         self.apps_refresh_btn = QPushButton(i18n.tr("apps_refresh"))
         self.apps_refresh_btn.clicked.connect(self.refresh_apps)
         top.addWidget(self.apps_refresh_btn)
-        top.addStretch(1)
+        top.addSpacing(12)
+        top.addWidget(QLabel(i18n.tr("apps_search")))
+        self.apps_search = QLineEdit()
+        self.apps_search.setPlaceholderText(i18n.tr("apps_search_hint"))
+        self.apps_search.setClearButtonEnabled(True)
+        self.apps_search.textChanged.connect(self._filter_apps)
+        top.addWidget(self.apps_search, 1)
         layout.addLayout(top)
 
         self.apps_tree = QTreeWidget()
         self.apps_tree.setHeaderLabels([i18n.tr("apps_col_pkg"),
                                         i18n.tr("apps_col_ver"),
+                                        i18n.tr("apps_col_origin"),
                                         i18n.tr("apps_col_path")])
         self.apps_tree.setRootIsDecorated(False)
         self.apps_tree.setAlternatingRowColors(True)
-        self.apps_tree.header().resizeSection(0, 220)
+        self.apps_tree.header().resizeSection(0, 210)
+        self.apps_tree.header().resizeSection(2, 90)
         self.apps_tree.itemDoubleClicked.connect(lambda *_: self._app_details())
         layout.addWidget(self.apps_tree, 1)
 
@@ -515,9 +523,40 @@ class AdbToolkitDialog(QDialog):
         self.install_btn = QPushButton(i18n.tr("apps_install"))
         self.install_btn.clicked.connect(self._install_apk)
         actions2.addWidget(self.install_btn)
+        self.export_btn = QPushButton(i18n.tr("apps_export"))
+        self.export_btn.clicked.connect(self._export_apps)
+        self.export_btn.setToolTip(i18n.tr("apps_export_saving"))
+        actions2.addWidget(self.export_btn)
         actions2.addStretch(1)
         layout.addLayout(actions2)
         return page
+
+    def _apps_status_text(self, total: int) -> str:
+        text = i18n.tr("apps_found", count=total)
+        if not total:
+            # Пусто — часто у pm на кривых прошивках: подсказываем, где
+            # посмотреть сырой ответ (журнал) и что попробовать ещё раз
+            text += " " + i18n.tr("apps_none_hint")
+        return text
+
+    def _filter_apps(self, _text=""):
+        """Прячет строки, где поиск не встречается ни в одной колонке."""
+        needle = self.apps_search.text().strip().lower()
+        shown = 0
+        total = self.apps_tree.topLevelItemCount()
+        for index in range(total):
+            item = self.apps_tree.topLevelItem(index)
+            match = not needle or any(
+                needle in (item.text(col) or "").lower()
+                for col in range(self.apps_tree.columnCount()))
+            item.setHidden(not match)
+            shown += match
+        if needle:
+            self.status.setText(i18n.tr("apps_filter_found",
+                                        shown=shown, total=total))
+        elif getattr(self, "_apps_total", None) is not None:
+            # поиск очищен — возвращаем статус последнего обновления списка
+            self.status.setText(self._apps_status_text(self._apps_total))
 
     def refresh_apps(self):
         kind = self.apps_kind.currentData() or "third"
@@ -532,18 +571,55 @@ class AdbToolkitDialog(QDialog):
             return
         self._idle()
         self.apps_tree.clear()
+        origin_keys = {"system": "apps_origin_system",
+                       "third": "apps_origin_third"}
         for app in apps or []:
-            # version/path пустые строки, если обогащение не добрало данных
+            # version/path/origin пустые, если обогащение не добрало данных
+            origin_key = origin_keys.get(app.get("origin", ""),
+                                         "apps_origin_unknown")
             item = QTreeWidgetItem([app["package"], app.get("version") or "",
-                                    app.get("path", "")])
+                                    i18n.tr(origin_key), app.get("path", "")])
             item.setData(0, Qt.UserRole, app["package"])
             self.apps_tree.addTopLevelItem(item)
-        status_text = i18n.tr("apps_found", count=len(apps or []))
+        self._apps_total = len(apps or [])
+        self.status.setText(self._apps_status_text(self._apps_total))
+        self._filter_apps()          # применяем активный поиск к новому списку
+
+    # ------------------------------------------------------- выгрузка для ИИ
+    def _export_apps(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, i18n.tr("apps_export"), "droidscout_apps.csv",
+            "CSV (*.csv);;JSON (*.json)")
+        if not path:
+            return
+        self.export_btn.setEnabled(False)
+        self._busy("apps_export_saving")
+        self._run(lambda count, exc: self._on_export(path, count, exc),
+                  self._collect_and_export, self.ip, path)
+
+    @staticmethod
+    def _collect_and_export(host, path):
+        """Полный список с устройства -> файл на ПК. Возвращает число пакетов.
+
+        Выполняется в ActionWorker: подключений несколько, на кривых
+        прошивках это может занять до минуты.
+        """
+        apps = adb_actions.collect_apps(host)
         if not apps:
-            # Пусто — часто у pm на кривых прошивках: подсказываем, где
-            # посмотреть сырой ответ (журнал) и что попробовать ещё раз
-            status_text += " " + i18n.tr("apps_none_hint")
-        self.status.setText(status_text)
+            raise adb_actions.ActionError(
+                "pm list вернул ноль пакетов (сырые ответы — в журнале)", "")
+        if path.lower().endswith(".json"):
+            exporter.export_apps_json(path, apps)
+        else:
+            exporter.export_apps_csv(path, apps)
+        return len(apps)
+
+    def _on_export(self, path, count, exc):
+        self.export_btn.setEnabled(True)
+        if exc:
+            self._failed(exc)
+            return
+        self.status.setText(i18n.tr("apps_export_saved", path=path, count=count))
 
     def _selected_package(self):
         item = self.apps_tree.currentItem()
