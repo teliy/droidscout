@@ -334,7 +334,7 @@ class AdbDevice:
     """
 
     def __init__(self, host: str, port: int = 5555, timeout: float = 10.0,
-                 keypair: "dict | None" = None):
+                 keypair: "dict | None" = None, tls: bool = False):
         self.host = host
         self.port = port
         self.timeout = timeout
@@ -342,6 +342,7 @@ class AdbDevice:
         self.sock = None
         self._local_id = 1
         self.keypair = keypair
+        self.tls = tls                  # ADB внутри TLS 1.3 (Android 11+ Wi-Fi)
         self.public_key_sent = False   # True → устройство ждало подтверждения
         self.bad_checksums = 0         # пакеты с неверной суммой (кривые прошивки)
 
@@ -368,6 +369,13 @@ class AdbDevice:
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass  # экзотическая платформа — работает и без этого
+        if self.tls:
+            # «Отладка по Wi-Fi» (Android 11+): обычный ADB-протокол течёт
+            # внутри TLS 1.3 с клиентским сертификатом. Обёртка даёт сокет
+            # с тем же интерфейсом (recv/sendall/settimeout/close).
+            from . import wifi_pair
+            key = self.keypair or load_or_create_keys()
+            self.sock = wifi_pair.wrap_tls(self.sock, self.timeout, key)
         self._send(A_CNXN, A_VERSION, MAX_PAYLOAD, b"host::\x00")
         deadline_ts = _now() + deadline
         pubkey_sent = False

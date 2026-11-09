@@ -20,6 +20,7 @@ import time
 
 from . import journal
 from . import pure_adb
+from . import wifi_pair
 from .pure_adb import (AdbError, AdbTimeout, AdbUnauthorized,  # noqa: F401
                        AdbDevice, shlex_quote)
 
@@ -63,7 +64,14 @@ def _open(host: str, port: int = 5555, timeout: float = 8.0) -> AdbDevice:
     ТВ-приставки часто держат «полуоткрытые» соединения после предыдущей
     сессии и сбрасывают первый контакт. Если хост недоступен («connect: …»)
     — повтор бессмыслен, падаем сразу.
+
+    Устройства, сопряжённые по «Отладке по Wi-Fi» (Android 11+), живут в
+    реестре wifi_pair: для них порт берётся из реестра, а ADB-протокол
+    идёт внутри TLS 1.3 с нашим клиентским сертификатом.
     """
+    secure_port = wifi_pair.get_secure_port(host)
+    if secure_port:
+        port = secure_port
     try:
         keypair = pure_adb.load_or_create_keys()
     except Exception as exc:  # noqa: BLE001
@@ -71,7 +79,8 @@ def _open(host: str, port: int = 5555, timeout: float = 8.0) -> AdbDevice:
         raise ActionError(f"keygen: {exc}", "conn") from exc
     last = None
     for attempt in (1, 2):
-        device = AdbDevice(host, port, timeout=timeout, keypair=keypair)
+        device = AdbDevice(host, port, timeout=timeout, keypair=keypair,
+                           tls=bool(secure_port))
         started = time.monotonic()
         try:
             device.connect(auth_timeout=max(timeout, 30.0))

@@ -19,6 +19,7 @@ from ..fingerprint import Device, type_label, verdict_label
 from .device_model import DeviceModel
 from .adb_toolkit import AdbToolkitDialog
 from .deep_scan import DeepScanDialog
+from .pair_dialog import PairDialog
 from .dialogs import (AdbInstallDialog, AdbQueryWorker, SettingsDialog,
                       UpdateDialog, UpdateWorker)
 from .theme import apply_theme, app_icon, theme_bg
@@ -90,6 +91,12 @@ class MainWindow(QMainWindow):
         self.fav_btn.setToolTip(i18n.tr("fav_filter_hint"))
         self.fav_btn.toggled.connect(self._set_fav_only)
         toolbar.addWidget(self.fav_btn)
+
+        self.wifi_btn = QToolButton()
+        self.wifi_btn.setText(i18n.tr("wifi_btn"))
+        self.wifi_btn.setToolTip(i18n.tr("wifi_title"))
+        self.wifi_btn.clicked.connect(self._open_pair_dialog)
+        toolbar.addWidget(self.wifi_btn)
         toolbar.addSeparator()
 
         self.net_label = QLabel(i18n.tr("network"))
@@ -288,6 +295,15 @@ class MainWindow(QMainWindow):
         """Вызывается после show(): авто-проверка обновлений."""
         if config.get("check_updates_on_start", True):
             QTimer.singleShot(800, self.check_updates_silent)
+
+    # --------------------------------------------------- телефон по Wi-Fi
+    def _open_pair_dialog(self):
+        """Сопряжение с телефоном (Android 11+) и добавление в таблицу."""
+        dialog = PairDialog(self)
+        if dialog.exec() and dialog.device is not None:
+            self.model.add_device(dialog.device)
+            self.status_label.setText(i18n.tr("wifi_added",
+                                              ip=dialog.device.ip))
 
     # ------------------------------------------------------------- сканирование
     def start_scan(self):
