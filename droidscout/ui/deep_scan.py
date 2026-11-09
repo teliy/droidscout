@@ -20,10 +20,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal, QUrl
 from PySide6.QtGui import QDesktopServices, QFont, QColor
-from PySide6.QtWidgets import (QFileDialog, QGridLayout, QHBoxLayout, QHeaderView,
-                               QLabel, QPlainTextEdit, QProgressBar, QPushButton,
-                               QTableWidget, QTableWidgetItem, QVBoxLayout,
-                               QWidget, QApplication, QGroupBox)
+from PySide6.QtWidgets import (QDialog, QFileDialog, QGridLayout, QHBoxLayout,
+                               QHeaderView, QLabel, QPlainTextEdit, QProgressBar,
+                               QPushButton, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QApplication, QGroupBox)
 
 from .. import i18n, netprobe
 
@@ -147,11 +147,19 @@ def _hexdump(data: bytes, limit: int = 512) -> str:
     return "\n".join(lines)
 
 
-class DeepScanDialog(QWidget):
-    """Немодальное окно глубокого опроса одного устройства."""
+class DeepScanDialog(QDialog):
+    """Немодальное окно глубокого опроса одного устройства.
+
+    Именно QDialog, а не QWidget: в теме фон задан правилом
+    `QMainWindow, QDialog { background-color: ... }`, а окно на голом QWidget
+    получается прозрачным — сквозь него просвечивает главное окно и кажется,
+    что элементы накладываются друг на друга (баг v1.3.0–v1.3.2).
+    """
 
     def __init__(self, device, parent=None):
         super().__init__(parent)
+        # немодальное окно с обычной рамкой, поверх главного
+        self.setModal(False)
         self.device = device
         self._results = []                       # list[dict] в порядке прихода
         self._by_port = {}                       # порт -> dict
