@@ -36,12 +36,31 @@ MAX_PAYLOAD = 256 * 1024        # предлагаемый размер чанк
 _CNXN_GRACE = 1.0               # окно ожидания AUTH после первого CNXN (сек)
 _MAX_RECV = 16 * 1024 * 1024    # санитарный предел длины пакета от устройства
 
+# Команда в заголовке пакета — little-endian uint32, поэтому первые 4 байта
+# пакета на проводе читаются как ASCII-имя команды (Wireshark разбирает ADB
+# именно по этим байтам). Значения сверены с adb.h из AOSP:
+#   A_CNXN 0x4e584e43, A_AUTH 0x48545541, A_OPEN 0x4e45504f,
+#   A_OKAY 0x59414b4f, A_WRTE 0x45545257, A_CLSE 0x45534c43.
+# История: в 1.6.0 пять констант были записаны с обратным порядком байтов
+# (например OPEN = 0x4F50454E -> на проводе "NEPO"). CNXN был верным, поэтому
+# handshake проходил, а OPEN adbd молча игнорировал ("handle_packet: what is
+# 0x4f50454e?!") — любая shell-команда падала по таймауту, хотя в консоли
+# adb всё работало. Мок-тесты не ловили это, потому что фейковый сервер брал
+# константы из того же модуля. Теперь константы пинятся тестом (см.
+# scripts/test_pure_adb.py) и самопроверкой ниже.
 A_CNXN = 0x4E584E43             # "CNXN" — установка соединения
-A_AUTH = 0x41755448             # "AUTH"  — аутентификация RSA
-A_OPEN = 0x4F50454E             # "OPEN"  — открыть поток (shell:…)
-A_OKAY = 0x4F4B4159             # "OKAY"  — подтверждение
-A_WRTE = 0x57525445             # "WRTE"  — данные потока
-A_CLSE = 0x434C5345             # "CLSE"  — закрыть поток
+A_AUTH = 0x48545541             # "AUTH"  — аутентификация RSA
+A_OPEN = 0x4E45504F             # "OPEN"  — открыть поток (shell:…)
+A_OKAY = 0x59414B4F             # "OKAY"  — подтверждение
+A_WRTE = 0x45545257             # "WRTE"  — данные потока
+A_CLSE = 0x45534C43             # "CLSE"  — закрыть поток
+
+for _cmd_name, _cmd_value in (("CNXN", A_CNXN), ("AUTH", A_AUTH),
+                              ("OPEN", A_OPEN), ("OKAY", A_OKAY),
+                              ("WRTE", A_WRTE), ("CLSE", A_CLSE)):
+    assert _cmd_value == int.from_bytes(_cmd_name.encode("ascii"), "little"), \
+        f"ADB command constant for {_cmd_name} has wrong byte order"
+del _cmd_name, _cmd_value
 
 AUTH_TOKEN = 1                  # device прислал одноразовый токен
 AUTH_SIGN = 2                   # мы подписали токен приватным ключом
@@ -436,7 +455,9 @@ class AdbDevice:
         local_id = self._local_id
         self._local_id += 2
         output = bytearray()
-        self._send(A_OPEN, local_id, 0, service + b"\x00")
+        # Сервис шлётся без завершающего NUL — ровно как официальный adb;
+        # adbd сам терминирует строку (smart_socket_data[len] = 0).
+        self._send(A_OPEN, local_id, 0, service)
         deadline = _now() + (timeout or self.timeout)
         while True:
             remaining = deadline - _now()
@@ -446,13 +467,17 @@ class AdbDevice:
                 message = self._recv(remaining)
             except (socket.timeout, TimeoutError) as exc:
                 raise AdbTimeout("shell timeout") from exc
-            if message.cmd == A_OKAY and message.arg1 == local_id:
+            # Стандарт: устройство шлёт arg0 = свой (remote) id, arg1 = наш
+            # (local) id. Кривые прошивки путают аргументы местами — у нас
+            # на соединении ровно один поток, поэтому сверяемся с обоими.
+            if message.cmd == A_OKAY and local_id in (message.arg0, message.arg1):
                 continue
-            if message.cmd == A_WRTE and message.arg1 == local_id:
+            if message.cmd == A_WRTE and local_id in (message.arg0, message.arg1):
                 output.extend(message.data)
-                self._send(A_OKAY, local_id, message.arg0)
+                remote = message.arg0 if message.arg0 != local_id else message.arg1
+                self._send(A_OKAY, local_id, remote)
                 continue
-            if message.cmd == A_CLSE and message.arg1 == local_id:
+            if message.cmd == A_CLSE and local_id in (message.arg0, message.arg1):
                 return bytes(output)
             if message.cmd == A_AUTH:
                 raise AdbError("device restarted authentication mid-session")
@@ -510,7 +535,7 @@ class AdbDevice:
 
         local_id = self._local_id
         self._local_id += 2
-        self._send(A_OPEN, local_id, 0, b"sync:\x00")
+        self._send(A_OPEN, local_id, 0, b"sync:")
         got_okay = False
         while not got_okay:
             message = self._recv(remaining())
