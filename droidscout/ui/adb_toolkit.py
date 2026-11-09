@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QFileDialog, QFormLayout,
                                QPushButton, QSpinBox, QTabWidget, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from .. import adb_actions, i18n
+from .. import adb_actions, i18n, journal
+from .journal_dialog import JournalDialog
 from .theme import is_dark_theme
 
 RISK_COLORS = {"low": "#43a047", "medium": "#fb8c00",
@@ -102,6 +103,9 @@ class AdbToolkitDialog(QDialog):
         self.status = QLabel("")
         self.status.setWordWrap(True)
         bottom.addWidget(self.status, 1)
+        journal_btn = QPushButton(i18n.tr("journal_btn"))
+        journal_btn.clicked.connect(self._open_journal)
+        bottom.addWidget(journal_btn)
         close_btn = QPushButton(i18n.tr("close"))
         close_btn.clicked.connect(self.reject)
         bottom.addWidget(close_btn)
@@ -113,11 +117,16 @@ class AdbToolkitDialog(QDialog):
 
     # ------------------------------------------------------------ инфраструктура
     def _run(self, callback, fn, *args, **kwargs):
+        # Отметка действия пользователя в журнале: видно, какую кнопку нажали
+        journal.action(getattr(fn, "__name__", "action") or "action", args)
         worker = ActionWorker(lambda: fn(*args, **kwargs), self)
         worker.result.connect(callback)
         self._workers.append(worker)
         worker.start()
         return worker
+
+    def _open_journal(self):
+        JournalDialog(self).show()
 
     def _busy(self, text_key="toolkit_busy"):
         self.status.setText(i18n.tr(text_key))
@@ -527,7 +536,12 @@ class AdbToolkitDialog(QDialog):
             item = QTreeWidgetItem([app["package"], "", app.get("path", "")])
             item.setData(0, Qt.UserRole, app["package"])
             self.apps_tree.addTopLevelItem(item)
-        self.status.setText(i18n.tr("apps_found", count=len(apps or [])))
+        status_text = i18n.tr("apps_found", count=len(apps or []))
+        if not apps:
+            # Пусто — часто у pm на кривых прошивках: подсказываем, где
+            # посмотреть сырой ответ (журнал) и что попробовать ещё раз
+            status_text += " " + i18n.tr("apps_none_hint")
+        self.status.setText(status_text)
 
     def _selected_package(self):
         item = self.apps_tree.currentItem()

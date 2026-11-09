@@ -17,6 +17,7 @@ import datetime
 import re
 import time
 
+from . import journal
 from . import pure_adb
 from .pure_adb import (AdbError, AdbTimeout, AdbUnauthorized,  # noqa: F401
                        AdbDevice, shlex_quote)
@@ -62,31 +63,48 @@ def _open(host: str, port: int = 5555, timeout: float = 8.0) -> AdbDevice:
     try:
         keypair = pure_adb.load_or_create_keys()
     except Exception as exc:  # noqa: BLE001
+        journal.error(f"{host}:{port}", "keygen", exc)
         raise ActionError(f"keygen: {exc}", "conn") from exc
     last = None
     for attempt in (1, 2):
         device = AdbDevice(host, port, timeout=timeout, keypair=keypair)
+        started = time.monotonic()
         try:
             device.connect(auth_timeout=max(timeout, 30.0))
+            journal.event(f"{host}:{port}",
+                          f"connect ok (попытка {attempt}, "
+                          f"{time.monotonic() - started:.2f}s)")
             return device
         except AdbUnauthorized as exc:
             device.close()
+            journal.error(f"{host}:{port}", "connect", exc)
             raise ActionError(str(exc), "unauthorized") from exc
         except (AdbError, AdbTimeout, OSError) as exc:
             device.close()
             last = exc
             if str(exc).startswith("connect:") or attempt == 2:
+                journal.error(f"{host}:{port}", "connect", exc)
                 break
             time.sleep(0.4)
     raise ActionError(str(last), "conn") from last
 
 
 def shell(host: str, command: str, port: int = 5555, timeout: float = 10.0) -> str:
-    """Одна shell-команда на устройстве. Возвращает вывод."""
+    """Одна shell-команда на устройстве. Возвращает вывод.
+
+    Каждая команда и её ответ попадают в журнал (journal.command) — это
+    основной материал для разбора «в консоли работает, в утилите нет».
+    """
     device = _open(host, port, timeout)
+    started = time.monotonic()
     try:
-        return device.shell(command, timeout=timeout)
+        output = device.shell(command, timeout=timeout)
+        journal.command(f"{host}:{port}", command, output,
+                        time.monotonic() - started)
+        return output
     except (AdbError, AdbTimeout, OSError) as exc:
+        journal.command(f"{host}:{port}", command, "",
+                        time.monotonic() - started, error=repr(exc))
         raise ActionError(str(exc), "conn") from exc
     finally:
         device.close()
@@ -98,6 +116,7 @@ def screenshot(host: str, port: int = 5555, timeout: float = 20.0) -> bytes:
     device = _open(host, port, timeout)
     try:
         raw = device.exec_out("screencap -p", timeout=timeout)
+        journal.event(f"{host}:{port}", f"screencap exec: {len(raw)} B")
         if raw.startswith(PNG_MAGIC):
             return raw
         # Старые adbd искажают бинарный вывод — снимаем в файл и кодируем
@@ -168,12 +187,43 @@ def parse_pm_list(text: str) -> "list[tuple[str, str]]":
 
 def list_apps(host: str, kind: str = "third", port: int = 5555,
               timeout: float = 20.0) -> "list[dict]":
-    """Список пакетов. kind: 'third' (-3), 'system' (-s), 'all'."""
-    flags = {"third": "-f -3", "system": "-f -s", "all": "-f"}.get(kind, "-f -3")
-    text = shell(host, f"pm list packages {flags}", port, timeout)
-    apps = [{"package": name, "path": path} for name, path in parse_pm_list(text)]
-    apps.sort(key=lambda item: item["package"].lower())
-    return apps
+    """Список пакетов. kind: 'third' (-3), 'system' (-s), 'all'.
+
+    На части прошивок `pm` отвергает флаги (-f/-3/-s) или молча отдаёт
+    пустоту на комбинацию, которая работает в консоли пользователя.
+    Поэтому список снимается цепочкой попыток с разными флагами, каждая
+    попытка — в журнал (сырой ответ виден целиком):
+
+      third:  `pm list packages -3`  →  `-f -3`  →  `-f` (только /data/*)
+      system: `pm list packages -s`  →  `-f -s`  →  `-f` (только /system|product|vendor)
+      all:    `pm list packages`     →  `-f`
+    """
+    chains = {
+        "third": ("-3", "-f -3", "-f"),
+        "system": ("-s", "-f -s", "-f"),
+        "all": ("", "-f"),
+    }
+    variants = chains.get(kind, chains["third"])
+    for attempt, flags in enumerate(variants):
+        text = shell(host, f"pm list packages {flags}".rstrip(), port, timeout)
+        parsed = parse_pm_list(text)                 # [(package, path), …]
+        if flags == "-f" and kind in ("third", "system"):
+            # Прямой путь к пути APK: отделяем сторонние от системных сами
+            prefixes = ("/data",) if kind == "third" else ("/system", "/product", "/vendor")
+            parsed = [(name, path) for name, path in parsed
+                      if path.startswith(prefixes)]
+        if parsed:
+            if attempt:
+                journal.event(f"{host}:{port}",
+                              f"pm list: попытка {attempt + 1} ({flags or 'без флагов'}) "
+                              f"— {len(parsed)} пакетов")
+            apps = [{"package": name, "path": path} for name, path in parsed]
+            apps.sort(key=lambda item: item["package"].lower())
+            return apps
+        journal.event(f"{host}:{port}",
+                      f"pm list ({flags or 'без флагов'}): 0 пакетов, "
+                      f"сырой ответ {len(text)} B — в журнале")
+    return []
 
 
 def parse_dumpsys_package(text: str) -> dict:
@@ -238,6 +288,7 @@ def install_apk(host: str, apk_path: str, port: int = 5555,
         raise ActionError("empty apk", "")
     device = _open(host, port, max(timeout, 30.0))
     try:
+        journal.event(f"{host}:{port}", f"push APK: {len(data)} B -> {APK_PATH}")
         device.push_bytes(data, APK_PATH, timeout=timeout)
         output = device.shell(f"pm install -r {APK_PATH} && rm -f {APK_PATH}",
                               timeout=timeout)

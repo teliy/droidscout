@@ -28,6 +28,7 @@ import time
 from shlex import quote as shlex_quote
 
 from . import config
+from . import journal
 
 # ---------------------------------------------------------------- константы
 A_VERSION = 0x01000001          # версия протокола (device возьмёт минимум)
@@ -597,22 +598,29 @@ def query_device(ip: str, port: int = 5555, timeout: float = 8.0,
     try:
         keypair = load_or_create_keys(create=create_keys)
     except Exception as exc:  # noqa: BLE001 — сбой генерации не должен ронять UI
+        journal.error(f"{ip}:{port}", "poll/keygen", exc)
         return {}, f"conn:keygen failed: {exc}"
     device = AdbDevice(ip, port, timeout=timeout, keypair=keypair)
     try:
         device.connect(auth_timeout=max(timeout, 30.0))
-    except AdbUnauthorized:
+    except AdbUnauthorized as exc:
+        journal.error(f"{ip}:{port}", "poll/connect", exc)
         return {}, "unauthorized"
     except AdbTimeout as exc:
+        journal.error(f"{ip}:{port}", "poll/connect", exc)
         return {}, f"conn:{exc}"
     except AdbError as exc:
+        journal.error(f"{ip}:{port}", "poll/connect", exc)
         return {}, f"conn:{exc}"
     except OSError as exc:
+        journal.error(f"{ip}:{port}", "poll/connect", exc)
         return {}, f"conn:{exc}"
     try:
         raw = device.get_properties(timeout=timeout)
+        journal.event(f"{ip}:{port}", f"poll ok: {len(raw)} свойств")
         return _normalize(raw), ""
     except (AdbError, OSError) as exc:
+        journal.error(f"{ip}:{port}", "poll/getprop", exc)
         return {}, f"conn:{exc}"
     finally:
         device.close()
