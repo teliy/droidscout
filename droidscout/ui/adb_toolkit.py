@@ -42,6 +42,11 @@ def _friendly_error(exc: Exception, ip: str) -> str:
         if exc.code == "conn":
             key = "adb_conn_protocol" if _PROTO_ERR_RE.search(str(exc)) else "adb_conn"
             return i18n.tr(key, ip=ip, port=5555, error=str(exc)[:150])
+        if exc.code == "denied":
+            return i18n.tr("files_denied",
+                           path=str(exc).rsplit(": ", 1)[-1])
+        if exc.code == "nopath":
+            return i18n.tr("files_nopath", path=str(exc).rsplit(": ", 1)[-1])
     return str(exc)[:250]
 
 
@@ -95,6 +100,7 @@ class AdbToolkitDialog(QDialog):
         self.tabs.addTab(self._tab_apps(), i18n.tr("tab_adb_apps"))
         self.tabs.addTab(self._tab_remote(), i18n.tr("tab_adb_remote"))
         self.tabs.addTab(self._tab_screenshot(), i18n.tr("tab_adb_shot"))
+        self.tabs.addTab(self._tab_files(), i18n.tr("tab_adb_files"))
         self.tabs.addTab(self._tab_shell(), i18n.tr("tab_adb_shell"))
         self.tabs.addTab(self._tab_logcat(), i18n.tr("tab_adb_logcat"))
         root.addWidget(self.tabs, 1)
@@ -847,6 +853,145 @@ class AdbToolkitDialog(QDialog):
             self.status.setText(i18n.tr("shot_saved", path=path))
         except OSError as exc:
             self.status.setText(i18n.tr("toolkit_error", error=str(exc)[:200]))
+
+    # --------------------------------------------------------------- таб: Файлы
+    QUICK_DIRS = ("/system", "/vendor", "/data", "/data/local/tmp", "/sdcard")
+
+    def _tab_files(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel(i18n.tr("files_path")))
+        self.files_path = QLineEdit("/")
+        self.files_path.returnPressed.connect(self.refresh_files)
+        top.addWidget(self.files_path, 1)
+        self.files_up_btn = QPushButton(i18n.tr("files_up"))
+        self.files_up_btn.clicked.connect(self._files_up)
+        top.addWidget(self.files_up_btn)
+        self.files_refresh_btn = QPushButton(i18n.tr("files_refresh"))
+        self.files_refresh_btn.clicked.connect(self.refresh_files)
+        top.addWidget(self.files_refresh_btn)
+        layout.addLayout(top)
+
+        quick = QHBoxLayout()
+        quick.addWidget(QLabel(i18n.tr("files_quick")))
+        for place in self.QUICK_DIRS:
+            btn = QPushButton(place)
+            btn.clicked.connect(lambda _=False, p=place: self._files_goto(p))
+            quick.addWidget(btn)
+        quick.addStretch(1)
+        layout.addLayout(quick)
+
+        self.files_tree = QTreeWidget()
+        self.files_tree.setHeaderLabels([i18n.tr("files_col_name"),
+                                         i18n.tr("files_col_perms"),
+                                         i18n.tr("files_col_size"),
+                                         i18n.tr("files_col_date")])
+        self.files_tree.setRootIsDecorated(False)
+        self.files_tree.setAlternatingRowColors(True)
+        self.files_tree.header().resizeSection(0, 280)
+        self.files_tree.header().resizeSection(1, 110)
+        self.files_tree.header().resizeSection(2, 80)
+        self.files_tree.itemDoubleClicked.connect(self._files_open)
+        layout.addWidget(self.files_tree, 1)
+
+        actions = QHBoxLayout()
+        self.files_download_btn = QPushButton(i18n.tr("files_download"))
+        self.files_download_btn.clicked.connect(self._file_download)
+        actions.addWidget(self.files_download_btn)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        return page
+
+    def _files_join(self, name: str) -> str:
+        base = self.files_path.text().strip() or "/"
+        return base + name if base == "/" else base.rstrip("/") + "/" + name
+
+    def refresh_files(self):
+        self._busy()
+        self.files_refresh_btn.setEnabled(False)
+        self._run(self._on_files, adb_actions.list_dir, self.ip,
+                  self.files_path.text().strip() or "/")
+
+    def _on_files(self, listing, exc):
+        self.files_refresh_btn.setEnabled(True)
+        if exc:
+            self._failed(exc)
+            return
+        self._idle()
+        self.files_tree.clear()
+        entries = (listing or {}).get("entries", [])
+        for entry in entries:
+            label = entry["name"] + (f" -> {entry['target']}"
+                                     if entry.get("target") else "")
+            item = QTreeWidgetItem([label, entry.get("perms", ""),
+                                    entry.get("size", ""),
+                                    entry.get("date", "")])
+            item.setData(0, Qt.UserRole, entry)
+            self.files_tree.addTopLevelItem(item)
+        self.status.setText(i18n.tr("files_listed",
+                                    path=(listing or {}).get("path", ""),
+                                    count=len(entries)))
+
+    def _files_goto(self, path: str):
+        self.files_path.setText(path or "/")
+        self.refresh_files()
+
+    def _files_up(self):
+        path = self.files_path.text().strip() or "/"
+        parent = os.path.dirname(path.rstrip("/")) if path != "/" else ""
+        self._files_goto(parent or "/")
+
+    def _files_open(self, item, _column):
+        entry = item.data(0, Qt.UserRole) or {}
+        name = entry.get("name", "")
+        if not name:
+            return
+        if entry.get("target"):          # симлинк на абсолютный путь
+            target = entry["target"]
+            if target.startswith("/"):
+                self._files_goto(target)
+                return
+        if not entry.get("is_dir"):
+            return
+        self._files_goto(self._files_join(name))
+
+    def _file_download(self):
+        item = self.files_tree.currentItem()
+        if not item:
+            QMessageBox.information(self, i18n.tr("adb_result"),
+                                    i18n.tr("files_select"))
+            return
+        entry = item.data(0, Qt.UserRole) or {}
+        if entry.get("is_dir"):
+            QMessageBox.information(self, i18n.tr("adb_result"),
+                                    i18n.tr("files_is_dir"))
+            return
+        remote = self._files_join(entry.get("name", "file"))
+        path, _ = QFileDialog.getSaveFileName(
+            self, i18n.tr("files_download"), entry.get("name", "file"),
+            "All files (*)")
+        if not path:
+            return
+        self.files_download_btn.setEnabled(False)
+        self._busy("files_downloading")
+        self._run(lambda data, exc: self._on_file_data(path, data, exc),
+                  adb_actions.pull_file, self.ip, remote)
+
+    def _on_file_data(self, path, data, exc):
+        self.files_download_btn.setEnabled(True)
+        if exc:
+            self._failed(exc)
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(data or b"")
+        except OSError as e:
+            self._failed(adb_actions.ActionError(str(e), ""))
+            return
+        self.status.setText(i18n.tr("files_saved", path=path,
+                                    count=len(data or b"")))
 
     # --------------------------------------------------------------- таб: Консоль
     def _tab_shell(self):

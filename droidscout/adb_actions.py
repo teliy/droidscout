@@ -534,6 +534,128 @@ def install_apk(host: str, apk_path: str, port: int = 5555,
         device.close()
 
 
+# ---------------------------------------------------------------- файлы
+_LS_DATE_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2}|\w{3}\s+\d{1,2})\s+(\d{2}:\d{2}|\d{4})\s+(.*)$")
+
+
+def parse_ls_l(text: str) -> "list[dict]":
+    """Вывод 'ls -l [-a]' -> [{name, perms, size, date, is_dir, target}].
+
+    Понимает оба формата даты (toybox «2023-01-01 12:00» и toolbox
+    «Jan  1 12:00»/«Jan 1 2019»), наличие и отсутствие счётчика ссылок,
+    симлинки «name -> target». Строки «total N» и неразобранное
+    пропускаются — по этому признаку list_dir отличает удачный
+    разбор от кривого вывода и переходит к следующему варианту ls.
+    """
+    result = []
+    for line in (text or "").splitlines():
+        line = line.rstrip()
+        if not line or line.startswith(("total ", "Total ")):
+            continue
+        match = _LS_DATE_RE.search(line)
+        if not match or not match.group(3).strip():
+            continue
+        head = line[:match.start()].strip()
+        tokens = head.split()
+        if not tokens:
+            continue
+        perms = tokens[0]
+        # полноценная строка ls -l: права длиной 10, тип первым символом
+        if len(perms) < 10 or perms[0] not in "-dlbcps":
+            continue
+        size = ""
+        for token in reversed(tokens[1:]):
+            if "," in token:            # старшие/младшие номера устройств
+                continue
+            if token.isdigit():
+                size = token
+            break
+        name = match.group(3).strip()
+        target = ""
+        if perms[0] == "l" and " -> " in name:
+            name, target = name.split(" -> ", 1)
+        result.append({"name": name, "perms": perms, "size": size,
+                       "date": match.group(1) + " " + match.group(2),
+                       "is_dir": perms[0] == "d", "target": target})
+    return result
+
+
+def list_dir(host: str, path: str = "/", port: int = 5555,
+             timeout: float = 15.0) -> dict:
+    """Содержимое каталога: {'path', 'entries', 'via'}.
+
+    Цепочка попыток `ls -a -l` → `-l` → `-1` → голый `ls`: на кривых
+    прошивках ls не знает флагов или печатает usage-ошибку. Точки «.»
+    и «..» отфильтровываются; каталоги идут перед файлами. «Permission
+    denied» и «No such file or directory» распознаются сразу — это
+    честный ответ устройства, а не повод перебирать варианты ls:
+    ActionError с кодами 'denied'/'nopath' (UI переводит в подсказку
+    про root/опечатку в пути).
+    """
+    quoted = shlex_quote(path or "/")
+    denied = no_path = False
+    entries: "list[dict]" = []
+    used_via = ""
+    for attempt, flags in enumerate(("-a -l", "-l", "-1", "")):
+        command = " ".join(filter(None, ("ls", flags, quoted)))
+        text = shell(host, command, port, timeout)
+        if "Permission denied" in text:
+            denied = True
+            continue
+        if "No such file or directory" in text:
+            no_path = True
+            continue
+        entries = parse_ls_l(text)
+        if entries:
+            entries = [e for e in entries if e["name"] not in (".", "..")]
+            if entries or text.strip().lower().startswith("total"):
+                entries.sort(key=lambda e: (not e["is_dir"],
+                                            e["name"].lower()))
+                return {"path": path, "entries": entries, "via": command}
+            continue
+        if attempt == 2 and text.strip():
+            # голый список имён (ls -1): прав/размеров нет, но навигация
+            # по именам всё равно возможна
+            entries = [{"name": line.strip(), "perms": "", "size": "",
+                        "date": "", "is_dir": False, "target": ""}
+                       for line in text.splitlines() if line.strip()]
+            used_via = command
+            break
+        if text.strip().lower().startswith(("total", "usage", "bad")):
+            continue
+    if entries:
+        return {"path": path, "entries": entries, "via": used_via}
+    if no_path:
+        raise ActionError(f"ls: no such file or directory: {path}", "nopath")
+    if denied:
+        raise ActionError(f"ls: Permission denied: {path}", "denied")
+    return {"path": path, "entries": [], "via": "ls"}
+
+
+def pull_file(host: str, remote_path: str, port: int = 5555,
+              timeout: float = 60.0) -> bytes:
+    """Файл с устройства в память ПК (cat через exec:, фолбэк — base64).
+
+    cat не отличает «файл пуст» от «файл нечитаем»: текст ошибки
+    «cat: …: Permission denied» пришёл бы как содержимое — такие ответы
+    превращаются в ActionError с кодом 'denied'.
+    """
+    device = _open(host, port, timeout)
+    try:
+        data = device.pull_file(remote_path, timeout=timeout)
+    except (AdbError, AdbTimeout, OSError, ValueError) as exc:
+        journal.error(f"{host}:{port}", "pull", exc)
+        raise ActionError(str(exc), "conn") from exc
+    finally:
+        device.close()
+    if data.startswith(b"cat:") or b": Permission denied" in data[:100]:
+        raise ActionError(data.decode("utf-8", "replace").strip()[:120],
+                          "denied")
+    journal.event(f"{host}:{port}", f"pull {remote_path}: {len(data)} B")
+    return data
+
+
 # ---------------------------------------------------------------- статистика
 STATS_COMMAND = (
     "echo ==BATTERY; dumpsys battery 2>/dev/null; "
