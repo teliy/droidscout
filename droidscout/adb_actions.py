@@ -1233,7 +1233,7 @@ def parse_df(text: str) -> dict:
 
 
 def parse_battery(text: str) -> dict:
-    """'dumpsys battery' -> {level, temp_c, charging}."""
+    """'dumpsys battery' -> {level, temp_c, charging, voltage_mv}."""
     def num(name):
         match = re.search(rf"^\s*{name}:\s*(\d+)", text, re.M)
         return int(match.group(1)) if match else None
@@ -1247,6 +1247,9 @@ def parse_battery(text: str) -> dict:
     if temp is not None:
         result["temp_c"] = round(temp / 10.0, 1)
     result["charging"] = charging
+    voltage = num("voltage")
+    if voltage:
+        result["voltage_mv"] = voltage
     return result
 
 
@@ -1390,6 +1393,205 @@ def check_root(host: str, port: int = 5555, timeout: float = 12.0) -> dict:
     info["sdk"] = sections.get("SDK", "").strip()
     info["android_version"] = sections.get("REL", "").strip()
     return info
+
+
+# ------------------------------------------------------------- live-монитор
+MONITOR_COMMAND = (
+    "echo ==CPU; grep -E '^cpu[0-9]* ' /proc/stat 2>/dev/null; "
+    "echo ==FREQ; "
+    "for d in /sys/devices/system/cpu/cpu[0-9]*; do "
+    "[ -e \"$d/cpufreq/scaling_cur_freq\" ] && "
+    "echo \"${d##*cpu} $(cat $d/cpufreq/scaling_cur_freq 2>/dev/null)\"; done; "
+    "echo ==MEM; cat /proc/meminfo 2>/dev/null; "
+    "echo ==BATTERY; dumpsys battery 2>/dev/null; "
+    "echo ==THERM; "
+    "for z in /sys/class/thermal/thermal_zone*; do "
+    "[ -e \"$z/type\" ] && echo \"${z##*/} $(cat $z/type 2>/dev/null) "
+    "$(cat $z/temp 2>/dev/null)\"; done; "
+    "echo ==LOAD; cat /proc/loadavg 2>/dev/null; "
+    "echo ==UP; cat /proc/uptime 2>/dev/null; "
+    "echo ==END"
+)
+
+
+def read_monitor(host: str, port: int = 5555, timeout: float = 15.0) -> dict:
+    """Срез живых показателей одним shell-вызовом (см. MONITOR_COMMAND).
+
+    Возвращает {cpu, freqs, memory, battery, thermal, load, uptime_sec}.
+    Счётчики CPU абсолютные (с загрузки системы): загрузку в процентах
+    UI считает по разности двух соседних опросов.
+    """
+    text = shell(host, MONITOR_COMMAND, port, timeout)
+    sec = _sections(text)
+    mon: dict = {}
+    cpu = parse_cpu_stat(sec.get("CPU", ""))
+    if cpu.get("overall") or cpu.get("cores"):
+        mon["cpu"] = cpu
+    freqs = parse_cur_freqs(sec.get("FREQ", ""))
+    if freqs:
+        mon["freqs"] = freqs
+    if sec.get("MEM", "").strip():
+        mon["memory"] = parse_meminfo(sec["MEM"])
+    battery = parse_battery(sec.get("BATTERY", ""))
+    if battery.get("level") is not None:
+        mon["battery"] = battery
+    zones = parse_monitor_thermal(sec.get("THERM", ""))
+    if zones:
+        mon["thermal"] = zones
+    load = parse_loadavg(sec.get("LOAD", ""))
+    if load:
+        mon["load"] = load
+    up = parse_uptime(sec.get("UP", ""))
+    if up:
+        mon["uptime_sec"] = up
+    return mon
+
+
+def parse_cpu_stat(text: str) -> dict:
+    """Строки /proc/stat 'cpuN u n s idle iowait irq softirq steal …'.
+
+    -> {"overall": (busy, total), "cores": {0: (busy, total), …}};
+    busy = total − (idle + iowait). Загрузка в процентах считается по
+    разности двух опросов: 100·Δbusy/Δtotal.
+    """
+    result = {"overall": None, "cores": {}}
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 5 or not parts[0].startswith("cpu"):
+            continue
+        name = parts[0][3:]
+        try:
+            values = [int(v) for v in parts[1:]]
+        except ValueError:
+            continue
+        if not name:                      # агрегат по всем ядрам
+            result["overall"] = _cpu_busy_total(values)
+        else:
+            try:
+                result["cores"][int(name)] = _cpu_busy_total(values)
+            except ValueError:
+                continue
+    return result
+
+
+def _cpu_busy_total(values: list) -> "tuple[int, int]":
+    total = sum(values)
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    return (total - idle, total)
+
+
+def parse_cur_freqs(text: str) -> dict:
+    """Строки 'N 1900800' (ядро, кГц) -> {0: 1900800, …}."""
+    out = {}
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            out[int(parts[0])] = int(parts[1])
+    return out
+
+
+def parse_monitor_thermal(text: str) -> list:
+    """Строки 'thermal_zoneN Тип миллиградусы' -> [{type, temp_c}].
+
+    Значения вне диапазона −50…150 °C отбрасываются: часть зон
+    возвращает −ETIMEDOUT/0 вместо температуры.
+    """
+    out = []
+    for line in (text or "").splitlines():
+        match = re.match(r"^(thermal_zone\d+)\s+(\S+)\s+(-?\d+)\s*$",
+                         line.strip())
+        if not match:
+            continue
+        value = int(match.group(3)) / 1000.0
+        if -50.0 <= value <= 150.0:
+            out.append({"type": match.group(2), "temp_c": round(value, 1)})
+    return out
+
+
+# ------------------------------------------------------------ быстрые действия
+ACTION_STATE_COMMAND = (
+    "echo ==WIFI; settings get global wifi_on 2>/dev/null; "
+    "echo ==DATA; settings get global mobile_data 2>/dev/null; "
+    "echo ==BT; settings get global bluetooth_on 2>/dev/null; "
+    "echo ==AIR; settings get global airplane_mode_on 2>/dev/null; "
+    "echo ==BRIGHT; settings get system screen_brightness 2>/dev/null; "
+    "echo ==AUTOB; settings get system screen_brightness_mode 2>/dev/null; "
+    "echo ==END"
+)
+
+
+def parse_action_state(text: str) -> dict:
+    """Вывод ACTION_STATE_COMMAND -> состояние тумблеров.
+
+    {wifi, data, bluetooth, airplane, auto_brightness: True|False|None,
+     brightness: int|None}. None — настройка не читается (нет права
+     или нет такого ключа на прошивке).
+    """
+    sec = _sections(text)
+
+    def flag(name):
+        lines = sec.get(name, "").strip().splitlines()
+        if not lines or not lines[0].strip():
+            return None
+        return {"1": True, "0": False}.get(lines[0].strip())
+
+    state = {key: flag(name) for key, name in
+             (("wifi", "WIFI"), ("data", "DATA"), ("bluetooth", "BT"),
+              ("airplane", "AIR"), ("auto_brightness", "AUTOB"))}
+    lines = sec.get("BRIGHT", "").strip().splitlines()
+    state["brightness"] = (int(lines[0]) if lines and lines[0].strip().isdigit()
+                           else None)
+    return state
+
+
+def read_action_state(host: str, port: int = 5555, timeout: float = 10.0) -> dict:
+    """Текущее состояние тумблеров одним shell-вызовом."""
+    return parse_action_state(shell(host, ACTION_STATE_COMMAND, port, timeout))
+
+
+def service_toggle(host: str, service: str, enable: bool,
+                   port: int = 5555, timeout: float = 8.0) -> str:
+    """svc <service> enable|disable — wifi, data, bluetooth."""
+    if service not in ("wifi", "data", "bluetooth"):
+        raise ActionError(f"unknown service: {service}", "")
+    return shell(host, f"svc {service} {'enable' if enable else 'disable'}",
+                 port, timeout)
+
+
+# Режим полёта: сначала «cmd airplane-mode» (Android 8+, штатный путь
+# ConnectivityService), при отсутствии — settings + broadcast (старые прошивки).
+# Двойные скобки — экранирование фигурных скобок sh для str.format.
+_AIRPLANE_FALLBACK = (
+    "{{ settings put global airplane_mode_on {n}; "
+    "am broadcast -a android.intent.action.AIRPLANE_MODE "
+    "--ez state {state} >/dev/null 2>&1; }}")
+
+
+def set_airplane(host: str, enable: bool, port: int = 5555,
+                 timeout: float = 10.0) -> str:
+    """Режим полёта вкл/выкл."""
+    mode = "enable" if enable else "disable"
+    fallback = _AIRPLANE_FALLBACK.format(
+        n=1 if enable else 0, state="true" if enable else "false")
+    cmd = f"cmd airplane-mode {mode} 2>/dev/null || {fallback}"
+    return shell(host, cmd, port, timeout)
+
+
+def set_stayon(host: str, enable: bool, port: int = 5555,
+               timeout: float = 8.0) -> str:
+    """'svc power stayon' — не гасить экран, пока устройство на зарядке."""
+    return shell(host, f"svc power stayon {'true' if enable else 'false'}",
+                 port, timeout)
+
+
+def set_brightness(host: str, value: int, auto: "bool | None" = None,
+                   port: int = 5555, timeout: float = 8.0) -> str:
+    """Яркость 5–255 (+ опционально автояркость) через settings put."""
+    value = max(5, min(255, int(value)))
+    cmd = f"settings put system screen_brightness {value}"
+    if auto is not None:
+        cmd += f"; settings put system screen_brightness_mode {1 if auto else 0}"
+    return shell(host, cmd, port, timeout)
 
 
 # ---------------------------------------------------------------- экран (wm)

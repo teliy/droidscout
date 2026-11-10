@@ -784,9 +784,11 @@ def _now() -> float:
 
 # ------------------------------------------------------------- высокоуровневое
 def query_device(ip: str, port: int = 5555, timeout: float = 8.0,
-                 create_keys: bool = True) -> "tuple[dict[str, str], str]":
+                 create_keys: bool = True, tls: bool = False) -> "tuple[dict[str, str], str]":
     """Опрашивает устройство, возвращает (свойства, код_ошибки).
 
+    tls=True — ADB-протокол внутри TLS 1.3 (порт из реестра wifi_pair:
+    устройства, сопряжённые по «Отладке по Wi-Fi»).
     Коды ошибок: '' — успех; 'unauthorized'; 'conn:<детали>'.
     """
     try:
@@ -794,7 +796,7 @@ def query_device(ip: str, port: int = 5555, timeout: float = 8.0,
     except Exception as exc:  # noqa: BLE001 — сбой генерации не должен ронять UI
         journal.error(f"{ip}:{port}", "poll/keygen", exc)
         return {}, f"conn:keygen failed: {exc}"
-    device = AdbDevice(ip, port, timeout=timeout, keypair=keypair)
+    device = AdbDevice(ip, port, timeout=timeout, keypair=keypair, tls=tls)
     try:
         device.connect(auth_timeout=max(timeout, 30.0))
     except AdbUnauthorized as exc:

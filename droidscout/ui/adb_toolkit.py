@@ -1,8 +1,11 @@
 """ADB-инструментарий: диалог с вкладками поверх adb_actions.
 
-Вкладки: Инфо (батарея/память/диск/экран/риск), Приложения (запуск, остановка,
-удаление, отключение, очистка, установка APK), Пульт (D-pad, звук, питание,
-ввод текста), Скриншот, Консоль (shell) и Логкат.
+Вкладки: Инфо (батарея/память/диск/экран/риск), Железо (полный опрос),
+Монитор (живые CPU/RAM/батарея/температуры), Настройки, Действия
+(тумблеры Wi-Fi/данные/Bluetooth/полёт, экран, яркость), Приложения
+(запуск, остановка, удаление, отключение, очистка, установка APK),
+Пульт (D-pad, звук, питание, ввод текста), Скриншот, Файлы,
+Консоль (shell) и Логкат.
 
 Каждая операция выполняется в фоновом потоке (ActionWorker) — интерфейс
 не блокируется. Ошибки ActionError переводятся на язык интерфейса.
@@ -14,7 +17,7 @@ import os
 import re
 import threading
 
-from PySide6.QtCore import QObject, QRect, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QObject, QRect, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QImage, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                                QFileDialog, QFormLayout, QFrame, QGridLayout,
@@ -245,6 +248,10 @@ class AdbToolkitDialog(QDialog):
         self._root_info = {}
         self._dev_loaded = False
         self._pdns_loaded = False
+        self._act_loaded = False
+        self._mon_busy = False
+        self._mon_fails = 0
+        self._prev_cpu = None
         self.fav_apps = set(favorites.load(favorites.APPS_KEY))
 
         self.setWindowTitle(i18n.tr("toolkit_title", ip=self.ip))
@@ -262,9 +269,14 @@ class AdbToolkitDialog(QDialog):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._tab_info(), i18n.tr("tab_adb_info"))
         self.tabs.addTab(self._tab_hw(), i18n.tr("tab_adb_hw"))
+        self._monitor_page = self._tab_monitor()
+        self.tabs.addTab(self._monitor_page, i18n.tr("tab_adb_monitor"))
         self._settings_page = self._tab_settings()
         self.tabs.addTab(self._settings_page, i18n.tr("tab_adb_settings"))
         self.tabs.currentChanged.connect(self._maybe_load_settings)
+        self._actions_page = self._tab_actions()
+        self.tabs.addTab(self._actions_page, i18n.tr("tab_adb_actions"))
+        self.tabs.currentChanged.connect(self._maybe_actions)
         self.tabs.addTab(self._tab_apps(), i18n.tr("tab_adb_apps"))
         self.tabs.addTab(self._tab_remote(), i18n.tr("tab_adb_remote"))
         self.tabs.addTab(self._tab_screenshot(), i18n.tr("tab_adb_shot"))
@@ -758,6 +770,14 @@ class AdbToolkitDialog(QDialog):
                             i18n.tr("hw_temp_fmt", v=zone["temp_c"])))
         self._hw_section(tree, i18n.tr("hw_sec_thermal"), tz_rows)
 
+        # --- Датчики ----------------------------------------------------------------------------
+        sensors = hw.get("sensors") or []
+        if sensors:
+            sensor_rows = [(i18n.tr("hw_sensors_count_fmt", n=len(sensors)), "")]
+            for item in sensors[:30]:
+                sensor_rows.append((item["name"], item.get("vendor", "")))
+            self._hw_section(tree, i18n.tr("hw_sec_sensors"), sensor_rows)
+
         # --- Сеть -------------------------------------------------------------------------------
         net_rows = []
         for iface in hw.get("net") or []:
@@ -813,6 +833,152 @@ class AdbToolkitDialog(QDialog):
                  ", ".join(key_feats) if key_feats else ""),
                 ("", "\n".join(features)),
             ])
+
+    # ------------------------------------------------------------ таб: Монитор
+    def _tab_monitor(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        top = QHBoxLayout()
+        self.mon_auto = QCheckBox(i18n.tr("mon_auto"))
+        self.mon_auto.setChecked(True)
+        top.addWidget(self.mon_auto)
+        top.addWidget(QLabel(i18n.tr("mon_interval")))
+        self.mon_interval = QComboBox()
+        self.mon_interval.addItems(["2", "5", "10"])
+        self.mon_interval.currentIndexChanged.connect(self._mon_interval_changed)
+        top.addWidget(self.mon_interval)
+        refresh_btn = QPushButton(i18n.tr("stat_refresh"))
+        refresh_btn.clicked.connect(self.refresh_monitor)
+        top.addWidget(refresh_btn)
+        top.addStretch(1)
+        layout.addLayout(top)
+
+        form = QFormLayout()
+        self.mon_labels = {}
+        for key in ("mon_cpu", "mon_cores", "mon_ram", "mon_battery",
+                    "mon_temp", "mon_load", "mon_uptime"):
+            label = QLabel("—")
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self.mon_labels[key] = label
+            form.addRow(i18n.tr(key), label)
+        layout.addLayout(form)
+
+        hint = QLabel(i18n.tr("mon_hint"))
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        layout.addStretch(1)
+
+        self.mon_timer = QTimer(self)
+        self.mon_timer.setInterval(2000)
+        self.mon_timer.timeout.connect(self._mon_tick)
+        self.mon_timer.start()
+        return page
+
+    def _mon_interval_changed(self, index):
+        self.mon_timer.setInterval((2000, 5000, 10000)[max(0, min(index, 2))])
+
+    def _mon_tick(self):
+        if not self.mon_auto.isChecked():
+            return
+        if self.tabs.currentWidget() is not self._monitor_page:
+            return
+        self.refresh_monitor()
+
+    def _maybe_monitor(self, index):
+        """При открытии вкладки «Монитор» — сразу обновить показатели."""
+        if self.tabs.widget(index) is self._monitor_page:
+            self.refresh_monitor()
+
+    def refresh_monitor(self):
+        if self._mon_busy:
+            return
+        self._mon_busy = True
+        self._run(self._on_monitor, adb_actions.read_monitor, self.ip)
+
+    def _on_monitor(self, mon, exc):
+        self._mon_busy = False
+        if exc:
+            self._mon_fails += 1
+            if self._mon_fails >= 3 and self.mon_auto.isChecked():
+                self.mon_auto.setChecked(False)   # не молотим по мёртвому ADB
+            self._failed(exc)
+            return
+        self._mon_fails = 0
+        mon = mon or {}
+
+        cpu = mon.get("cpu") or {}
+        prev = self._prev_cpu or {}
+        self._prev_cpu = cpu
+
+        def pct(cur, old):
+            if not cur or not old:
+                return None
+            d_busy = cur[0] - old[0]
+            d_total = cur[1] - old[1]
+            if d_total <= 0 or d_busy < 0:
+                return None
+            return int(round(100 * d_busy / d_total))
+
+        overall = pct(cpu.get("overall"), prev.get("overall"))
+        self.mon_labels["mon_cpu"].setText(
+            i18n.tr("hw_pct_fmt", v=overall) if overall is not None else "—")
+
+        freqs = mon.get("freqs") or {}
+        prev_cores = prev.get("cores") or {}
+        parts = []
+        for core in sorted(cpu.get("cores") or {}):
+            load = pct(cpu["cores"][core], prev_cores.get(core))
+            text = f"cpu{core}: " + (i18n.tr("hw_pct_fmt", v=load)
+                                     if load is not None else "—")
+            if core in freqs:
+                text += f" · {_hw_freq(freqs[core])}"
+            parts.append(text)
+        self.mon_labels["mon_cores"].setText(" · ".join(parts) or "—")
+
+        memory = mon.get("memory") or {}
+        self.mon_labels["mon_ram"].setText(
+            i18n.tr("mon_ram_fmt", total=_hw_size(memory.get("total_mb")),
+                    used=i18n.tr("hw_pct_fmt", v=memory["used_pct"]))
+            if memory.get("used_pct") is not None else "—")
+
+        battery = mon.get("battery") or {}
+        if battery.get("level") is not None:
+            charging = i18n.tr("stat_charging") if battery.get("charging") \
+                else i18n.tr("stat_discharging")
+            extra = ""
+            if battery.get("temp_c") is not None:
+                extra += f", {i18n.tr('hw_temp_fmt', v=battery['temp_c'])}"
+            if battery.get("voltage_mv"):
+                extra += f", {i18n.tr('hw_mv_fmt', v=battery['voltage_mv'])}"
+            self.mon_labels["mon_battery"].setText(i18n.tr(
+                "stat_battery_fmt", level=battery["level"],
+                charging=charging, extra=extra))
+        else:
+            self.mon_labels["mon_battery"].setText("—")
+
+        zones = sorted(mon.get("thermal") or [],
+                       key=lambda z: -z["temp_c"])[:4]
+        self.mon_labels["mon_temp"].setText(
+            " · ".join(f"{_hw_tz_label(z['type']) or z['type']}: "
+                       f"{i18n.tr('hw_temp_fmt', v=z['temp_c'])}"
+                       for z in zones) or "—")
+
+        load = mon.get("load") or {}
+        self.mon_labels["mon_load"].setText(
+            i18n.tr("stat_load_fmt", l1=load["l1"], l5=load["l5"],
+                    l15=load["l15"]) if load else "—")
+
+        uptime = mon.get("uptime_sec")
+        if uptime:
+            days, rest = divmod(int(uptime), 86400)
+            hours, minutes = divmod(rest // 60, 60)
+            self.mon_labels["mon_uptime"].setText(i18n.tr(
+                "stat_uptime_fmt", days=days, hours=hours, minutes=minutes))
+        else:
+            self.mon_labels["mon_uptime"].setText("—")
+        self._idle()
 
     # ------------------------------------------------------------ таб: Настройки
     def _tab_settings(self):
@@ -1273,6 +1439,131 @@ class AdbToolkitDialog(QDialog):
         self._idle()
         self.status.setText(i18n.tr("screen_done", cmd=kind, value=value))
         self.refresh_stats()
+
+    # ------------------------------------------------------------ таб: Действия
+    def _tab_actions(self):
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+
+        net_box = QGroupBox(i18n.tr("act_group_net"))
+        grid = QGridLayout(net_box)
+        self._act_toggles = {}
+        for row, (service, label_key) in enumerate((
+                ("wifi", "act_wifi"), ("data", "act_data"),
+                ("bluetooth", "act_bt"), ("airplane", "act_airplane"))):
+            grid.addWidget(QLabel(i18n.tr(label_key)), row, 0)
+            state = QLabel("—")
+            state.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            grid.addWidget(state, row, 1)
+            on_btn = QPushButton(i18n.tr("act_enable"))
+            on_btn.clicked.connect(
+                lambda _=False, s=service: self._act_toggle(s, True))
+            grid.addWidget(on_btn, row, 2)
+            off_btn = QPushButton(i18n.tr("act_disable"))
+            off_btn.clicked.connect(
+                lambda _=False, s=service: self._act_toggle(s, False))
+            grid.addWidget(off_btn, row, 3)
+            self._act_toggles[service] = (state, on_btn, off_btn)
+        hint = QLabel(i18n.tr("act_net_hint"))
+        hint.setWordWrap(True)
+        grid.addWidget(hint, grid.rowCount(), 0, 1, 4)
+        layout.addWidget(net_box)
+
+        screen_box = QGroupBox(i18n.tr("act_group_screen"))
+        grid2 = QGridLayout(screen_box)
+        sleep_btn = QPushButton(i18n.tr("act_sleep"))
+        sleep_btn.clicked.connect(lambda _=False: self._send_key("sleep"))
+        grid2.addWidget(sleep_btn, 0, 0)
+        wake_btn = QPushButton(i18n.tr("act_wakeup"))
+        wake_btn.clicked.connect(lambda _=False: self._send_key("wakeup"))
+        grid2.addWidget(wake_btn, 0, 1)
+        self.stayon_check = QCheckBox(i18n.tr("act_stayon"))
+        self.stayon_check.toggled.connect(self._act_stayon)
+        grid2.addWidget(self.stayon_check, 0, 2)
+        grid2.addWidget(QLabel(i18n.tr("act_brightness")), 1, 0)
+        self.act_bright = QSpinBox()
+        self.act_bright.setRange(5, 255)
+        grid2.addWidget(self.act_bright, 1, 1)
+        self.act_auto = QCheckBox(i18n.tr("act_auto"))
+        grid2.addWidget(self.act_auto, 1, 2)
+        apply_btn = QPushButton(i18n.tr("screen_apply"))
+        apply_btn.clicked.connect(self._apply_brightness)
+        grid2.addWidget(apply_btn, 1, 3)
+        screen_hint = QLabel(i18n.tr("act_screen_hint"))
+        screen_hint.setWordWrap(True)
+        grid2.addWidget(screen_hint, 2, 0, 1, 4)
+        layout.addWidget(screen_box)
+        layout.addStretch(1)
+
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+        return page
+
+    def _maybe_actions(self, index):
+        """Состояние тумблеров читается при первом открытии вкладки."""
+        if self.tabs.widget(index) is self._actions_page \
+                and not self._act_loaded:
+            self._act_loaded = True
+            self.refresh_action_state()
+
+    def refresh_action_state(self):
+        self._run(self._on_action_state, adb_actions.read_action_state, self.ip)
+
+    def _on_action_state(self, state, exc):
+        if exc:
+            return                    # фоновый опрос состояния: без диалогов
+        state = state or {}
+        for service, (state_lbl, _on, _off) in self._act_toggles.items():
+            value = state.get(service)
+            state_lbl.setText(
+                i18n.tr("act_state_on") if value else
+                i18n.tr("act_state_off") if value is False else "—")
+        if state.get("brightness") is not None:
+            self.act_bright.setValue(state["brightness"])
+        if state.get("auto_brightness") is not None:
+            self.act_auto.setChecked(state["auto_brightness"])
+
+    def _act_toggle(self, service, enable):
+        state_lbl, on_btn, off_btn = self._act_toggles[service]
+        on_btn.setEnabled(False)
+        off_btn.setEnabled(False)
+        self._busy()
+        fn = adb_actions.set_airplane if service == "airplane" \
+            else adb_actions.service_toggle
+        self._run(lambda _o, exc: self._on_act_toggle(service, exc),
+                  fn, self.ip, enable)
+
+    def _on_act_toggle(self, service, exc):
+        _state_lbl, on_btn, off_btn = self._act_toggles[service]
+        on_btn.setEnabled(True)
+        off_btn.setEnabled(True)
+        if exc:
+            self._failed(exc)
+        else:
+            self.status.setText(i18n.tr("act_done"))
+        self.refresh_action_state()
+
+    def _act_stayon(self, enable):
+        self._busy()
+        self._run(lambda _o, exc: self._on_act_done(exc),
+                  adb_actions.set_stayon, self.ip, enable)
+
+    def _apply_brightness(self):
+        self._busy()
+        self._run(lambda _o, exc: self._on_act_done(exc),
+                  adb_actions.set_brightness, self.ip, self.act_bright.value(),
+                  self.act_auto.isChecked())
+
+    def _on_act_done(self, exc):
+        if exc:
+            self._failed(exc)
+        else:
+            self.status.setText(i18n.tr("act_done"))
 
     # ------------------------------------------------------------ таб: Приложения
     def _tab_apps(self):

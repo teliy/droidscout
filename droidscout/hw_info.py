@@ -59,6 +59,7 @@ HW_COMMAND = (
     "for z in /sys/class/thermal/thermal_zone*; do [ -e \"$z/type\" ] && "
     "echo \"${z##*/} $(cat $z/type 2>/dev/null) "
     "$(cat $z/temp 2>/dev/null)\"; done; "
+    "echo ==SENSORS; dumpsys sensorservice 2>/dev/null | head -n 90; "
     "echo ==FEATURES; pm list features 2>/dev/null; "
     "echo ==KERNEL; cat /proc/version 2>/dev/null; uname -m 2>/dev/null; "
     "echo ==UP; cat /proc/uptime 2>/dev/null; "
@@ -91,6 +92,7 @@ def read_hw(host: str, port: int = 5555, timeout: float = 30.0) -> dict:
         "battery": parse_battery_ext(sec.get("BATTERY", "")),
         "net": parse_net(sec.get("NET", "")),
         "thermal": parse_thermal_zones(sec.get("THERMAL", "")),
+        "sensors": parse_sensors(sec.get("SENSORS", "")),
         "features": parse_features(sec.get("FEATURES", "")),
         "kernel": parse_kernel(sec.get("KERNEL", "")),
         "soc": decode_soc(props, dt, cpuinfo),
@@ -581,6 +583,54 @@ def parse_display(text: str) -> dict:
         if 20.0 <= value <= 240.0:
             out["fps"] = value
             break
+    return out
+
+
+# ---------------------------------------------------------------- сенсоры
+def parse_sensors(text: str) -> list:
+    """Вывод 'dumpsys sensorservice' -> [{name, vendor}].
+
+    Понимает два формата Sensor List:
+      0x00000001) Accelerometer | vendor: … | version: … | …
+      0x00000002) name=Sensor vendor=Vendor version=1 …
+    Строки без распознаваемого имени пропускаются; список — в порядке
+    перечисления в dumpsys.
+    """
+    out = []
+    in_list = False
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if not in_list:
+            if line.lower().startswith("sensor list"):
+                in_list = True
+            continue
+        match = re.match(r"^0x[0-9a-fA-F]+\)\s*(\S.*)$", line)
+        if not match:
+            if out:                     # секция списка закончилась
+                break
+            continue
+        rest = match.group(1).strip()
+        name = vendor = ""
+        # Вариант с полями name=… vendor=… (до следующего ключа или конца строки)
+        nm = re.search(r"\bname=(.*?)(?=\s+\w+=|$)", rest)
+        if nm:
+            name = nm.group(1).strip()
+            vd = re.search(r"\bvendor=(.*?)(?=\s+\w+=|$)", rest)
+            if vd:
+                vendor = vd.group(1).strip()
+        else:
+            chunks = [chunk.strip() for chunk in rest.split("|")]
+            if chunks:
+                name = chunks[0]
+            for chunk in chunks[1:]:
+                if chunk.lower().startswith("vendor:"):
+                    vendor = chunk.split(":", 1)[1].strip()
+                    break
+        if not name:
+            continue
+        out.append({"name": name[:60], "vendor": vendor[:60]})
     return out
 
 

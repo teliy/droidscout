@@ -1,8 +1,10 @@
 """Опрос Android-устройства через ADB: встроенный клиент + внешний adb.
 
 Приоритет источников (настраивается ключом adb_native в settings):
-  1. Встроенный клиент (pure_adb): прямое TCP-соединение с adbd на порту
-     5555. Не требует установленного Platform-Tools.
+  1. Встроенный клиент (pure_adb): прямое TCP-соединение с adbd; для
+     устройств, сопряжённых по «Отладке по Wi-Fi», порт и TLS берутся из
+     реестра wifi_pair — как в adb_actions._open (без повторных
+     подтверждений на телефоне).
   2. Внешний adb (Platform-Tools): путь ищется adb_manager.find_adb() —
      настройка adb_path, каталог автоустановки или PATH.
 
@@ -15,7 +17,7 @@ import re
 import subprocess
 from typing import Dict, Tuple
 
-from . import adb_manager, config
+from . import adb_manager, config, wifi_pair
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -71,22 +73,33 @@ def native_enabled() -> bool:
 
 
 def query_device(ip: str, adb_port: int = 5555, timeout: int = 20) -> Tuple[Dict[str, str], str]:
-    """Возвращает (словарь свойств, код ошибки). Ошибка пуста при успехе."""
+    """Возвращает (словарь свойств, код ошибки). Ошибка пуста при успехе.
+
+    Сопряжённые по «Отладке по Wi-Fi» устройства опрашиваются по их
+    TLS-порту из реестра wifi_pair — раньше здесь жёстко шёл порт 5555,
+    и кнопка «ADB: запросить детали» падала даже после успешного
+    сопряжения в инструментарии.
+    """
     errors = []
+    native_unauth = False
     if native_enabled():
         from . import pure_adb  # локальный импорт: модуль тяжёлый только при auth
-        props, error = pure_adb.query_device(ip, port=adb_port, timeout=min(timeout, 12))
+        secure = wifi_pair.get_secure_port(ip)
+        props, error = pure_adb.query_device(
+            ip, port=secure or adb_port, timeout=min(timeout, 12),
+            tls=bool(secure))
         if props:
             props["adb_source"] = "native"
             return props, ""
+        native_unauth = error == "unauthorized"
         errors.append(error)
 
     adb = find_adb()
     if not adb:
         return {}, "adb_missing" if not errors else errors[0]
     try:
-        target = f"{ip}:{adb_port}"
-        # Если ADB слушает на 5555 — сначала подключаемся
+        target = f"{ip}:{wifi_pair.get_secure_port(ip) or adb_port}"
+        # Если ADB слушает на этом порту — сначала подключаемся
         subprocess.run([adb, "connect", target], capture_output=True, text=True,
                        timeout=timeout, creationflags=CREATE_NO_WINDOW)
         props = _getprop_batch(adb, target, timeout)
@@ -100,7 +113,12 @@ def query_device(ip: str, adb_port: int = 5555, timeout: int = 20) -> Tuple[Dict
         if props:
             props["adb_source"] = "adb"
             return props, ""
-        return {}, "unauthorized"
+        # «unauthorized» — только если кто-то из клиентов реально получил
+        # запрос авторизации: раньше сюда попадали и просто недоступные
+        # устройства, и пользователь видел неверную подсказку.
+        if native_unauth or _adb_unauthorized(adb, ip, timeout):
+            return {}, "unauthorized"
+        return {}, errors[0] if errors else "conn:device did not answer"
     except (subprocess.TimeoutExpired, OSError) as exc:
         return {}, f"conn:{exc}"
 
@@ -108,6 +126,21 @@ def query_device(ip: str, adb_port: int = 5555, timeout: int = 20) -> Tuple[Dict
 # ------------------------------------------------------------ внешний adb
 def _clean_output(text: str) -> str:
     return (text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _adb_unauthorized(adb: str, ip: str, timeout: int) -> bool:
+    """Внешний adb видит устройство с данным IP, но не подтверждено им."""
+    try:
+        proc = subprocess.run([adb, "devices", "-l"], capture_output=True,
+                              text=True, timeout=timeout,
+                              creationflags=CREATE_NO_WINDOW)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    for line in _clean_output(proc.stdout).splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and ip in parts[0] and parts[1] == "unauthorized":
+            return True
+    return False
 
 
 def _getprop_batch(adb: str, target: str, timeout: int) -> Dict[str, str]:
