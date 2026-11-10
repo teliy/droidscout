@@ -26,6 +26,27 @@ _STATUS_OK = "color:#7bd88f;"
 _STATUS_ERR = "color:#f45b69;"
 
 
+def _error_hint(detail: str, code: str) -> str:
+    """Человеческая подсказка по характеру ошибки подключения.
+
+    Два типовых случая: не тот порт (он меняется при каждом включении
+    «Отладки по Wi-Fi», порт сопряжения не подходит) и телефон отклонил
+    ключ (сопряжение делали давно/другим приложением — повторить шаг 1).
+    """
+    low = (detail or "").lower()
+    if (code in ("connect", "timeout", "adbconn")
+            or any(w in low for w in ("refused", "timed out", "timeout",
+                                      "unreachable", "no route", "network is",
+                                      "wrong version number",
+                                      "instead of stls"))):
+        return i18n.tr("wifi_hint_port")
+    if any(w in low for w in ("certificate", "alert", "handshake",
+                              "closed by device", "unexpected packet",
+                              "tls")):
+        return i18n.tr("wifi_hint_trust")
+    return ""
+
+
 class _PairWorker(QObject):
     """Сеть для мастера: поиск телефона, сопряжение или подключение."""
     done = Signal(dict)
@@ -43,6 +64,12 @@ class _PairWorker(QObject):
             if self.mode == "discover":
                 found = wifi_pair.discover_pairing(timeout=6.0)
                 self.done.emit({"stage": "discover", "ok": bool(found),
+                                "found": found})
+                return
+            if self.mode == "discover_conn":
+                found = wifi_pair.discover_connect(timeout=6.0,
+                                                   ip=self.ip or "")
+                self.done.emit({"stage": "discover_conn", "ok": bool(found),
                                 "found": found})
                 return
             if self.mode == "pair":
@@ -159,6 +186,9 @@ class PairDialog(QDialog):
         self.back_btn = QPushButton(i18n.tr("wifi_back"))
         self.back_btn.clicked.connect(self._go_step1)
         btns.addWidget(self.back_btn)
+        self.find_port_btn = QPushButton(i18n.tr("wifi_find_port"))
+        self.find_port_btn.clicked.connect(self._start_find_port)
+        btns.addWidget(self.find_port_btn)
         self.conn_btn = QPushButton(i18n.tr("wifi_connect"))
         self.conn_btn.setDefault(True)
         self.conn_btn.clicked.connect(self._start_connect)
@@ -206,6 +236,11 @@ class PairDialog(QDialog):
         self._begin(i18n.tr("wifi_finding"))
         self._spawn(_PairWorker("discover"))
 
+    def _start_find_port(self):
+        ip = self.ip2_edit.text().strip() or self.ip_edit.text().strip()
+        self._begin(i18n.tr("wifi_finding_port"))
+        self._spawn(_PairWorker("discover_conn", ip=ip))
+
     def _start_pair(self):
         ip = self.ip_edit.text().strip()
         pair_port = self._port(self.pair_port_edit)
@@ -231,7 +266,7 @@ class PairDialog(QDialog):
     # ------------------------------------------------------------ служебное
     def _begin(self, text: str):
         for btn in (self.find_btn, self.pair_btn, self.skip_btn,
-                    self.back_btn, self.conn_btn):
+                    self.back_btn, self.find_port_btn, self.conn_btn):
             btn.setEnabled(False)
         self._set_status(text)
 
@@ -263,7 +298,7 @@ class PairDialog(QDialog):
             self._thread = None
             self._worker = None
         for btn in (self.find_btn, self.pair_btn, self.skip_btn,
-                    self.back_btn, self.conn_btn):
+                    self.back_btn, self.find_port_btn, self.conn_btn):
             btn.setEnabled(True)
 
         stage = result.get("stage")
@@ -280,11 +315,33 @@ class PairDialog(QDialog):
                 self._set_status(i18n.tr("wifi_find_fail"))
             return
 
+        if stage == "discover_conn":
+            if result["ok"]:
+                found = result["found"]
+                wanted = (self.ip2_edit.text().strip()
+                          or self.ip_edit.text().strip())
+                if wanted in found:
+                    ip, port = wanted, found[wanted]
+                else:
+                    ip, port = sorted(found.items())[0]
+                if not self.ip2_edit.text().strip():
+                    self.ip2_edit.setText(ip)
+                self.conn_port_edit.setText(str(port))
+                self._set_status(i18n.tr("wifi_find_port_ok", ip=ip,
+                                         port=port), ok=True)
+                self.conn_btn.setFocus()
+            else:
+                self._set_status(i18n.tr("wifi_find_port_fail"))
+            return
+
         if not result["ok"]:
             key = f"wifi_err_{result['code']}"
             text = i18n.tr(key, err=result.get("detail", ""))
             if text == key:                    # нет перевода — общий формат
                 text = i18n.tr("wifi_err_generic", err=result.get("detail", ""))
+            hint = _error_hint(result.get("detail", ""), result.get("code", ""))
+            if hint:
+                text = f"{text}. {hint}"
             self._set_status(i18n.tr("wifi_fail", err=text))
             return
 

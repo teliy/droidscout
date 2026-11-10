@@ -457,14 +457,13 @@ PAIRING_MDNS_TYPE = "_adb-tls-pairing._tcp.local."
 CONNECT_MDNS_TYPE = "_adb-tls-connect._tcp.local."
 
 
-def discover_pairing(timeout: float = 6.0,
-                     stop: "threading.Event | None" = None) -> "dict[str, int]":
-    """Найти телефоны с открытым экраном «Сопряжение устройства с кодом».
+def _mdns_browse(mdns_type: str, timeout: float,
+                 ip_filter: str = "",
+                 stop: "threading.Event | None" = None) -> "dict[str, int]":
+    """Найти службы mDNS заданного типа. Возвращает {ip: порт}.
 
-    Пока этот экран открыт, телефон объявляет по mDNS службу
-    _adb-tls-pairing, в которой — актуальные IP и порт сопряжения.
-    Возвращает {ip: порт} всех найденных. Пустой dict: экран на телефоне
-    не открыт, сеть не пускает multicast или не установлен zeroconf.
+    ip_filter: если задан, остаются только совпавшие адреса (но браузер
+    всё равно слушает до тайм-аута — телефон мог появиться позже).
     """
     try:
         from zeroconf import ServiceBrowser, Zeroconf
@@ -482,6 +481,8 @@ def discover_pairing(timeout: float = 6.0,
                 ip = socket.inet_ntoa(info.addresses[0])
             except Exception:  # noqa: BLE001 — битая запись не роняет поиск
                 return
+            if ip_filter and ip != ip_filter:
+                return
             with lock:
                 found[ip] = int(info.port)
 
@@ -493,7 +494,7 @@ def discover_pairing(timeout: float = 6.0,
 
     zc = Zeroconf()
     try:
-        ServiceBrowser(zc, PAIRING_MDNS_TYPE, _Listener())
+        ServiceBrowser(zc, mdns_type, _Listener())
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if stop is not None and stop.is_set():
@@ -510,3 +511,29 @@ def discover_pairing(timeout: float = 6.0,
         except Exception:  # noqa: BLE001
             pass
     return found
+
+
+def discover_pairing(timeout: float = 6.0,
+                     stop: "threading.Event | None" = None) -> "dict[str, int]":
+    """Найти телефоны с открытым экраном «Сопряжение устройства с кодом».
+
+    Пока этот экран открыт, телефон объявляет по mDNS службу
+    _adb-tls-pairing, в которой — актуальные IP и порт сопряжения.
+    Возвращает {ip: порт} всех найденных. Пустой dict: экран на телефоне
+    не открыт, сеть не пускает multicast или не установлен zeroconf.
+    """
+    return _mdns_browse(PAIRING_MDNS_TYPE, timeout, stop=stop)
+
+
+def discover_connect(timeout: float = 6.0, ip: str = "",
+                     stop: "threading.Event | None" = None) -> "dict[str, int]":
+    """Найти телефоны с включённой «Отладкой по Wi-Fi» (порт подключения).
+
+    Главный экран «Отладка по Wi-Fi» (строка «IP-адрес и порт»)
+    объявляет по mDNS службу _adb-tls-connect с актуальным портом
+    подключения — этот порт меняется при каждом включении отладки,
+    поэтому вручную легко ввести устаревший. ip: если задан, вернуть
+    только этот адрес. Пустой dict — телефон не найден.
+    """
+    return _mdns_browse(CONNECT_MDNS_TYPE, timeout, ip_filter=ip or "",
+                        stop=stop)
