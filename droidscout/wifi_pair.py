@@ -450,3 +450,63 @@ def forget_secure(ip: str) -> None:
     if ip in _load():
         del _cache[ip]
         _save()
+
+
+# -------------------------------------------- поиск экрана сопряжения (mDNS)
+PAIRING_MDNS_TYPE = "_adb-tls-pairing._tcp.local."
+CONNECT_MDNS_TYPE = "_adb-tls-connect._tcp.local."
+
+
+def discover_pairing(timeout: float = 6.0,
+                     stop: "threading.Event | None" = None) -> "dict[str, int]":
+    """Найти телефоны с открытым экраном «Сопряжение устройства с кодом».
+
+    Пока этот экран открыт, телефон объявляет по mDNS службу
+    _adb-tls-pairing, в которой — актуальные IP и порт сопряжения.
+    Возвращает {ip: порт} всех найденных. Пустой dict: экран на телефоне
+    не открыт, сеть не пускает multicast или не установлен zeroconf.
+    """
+    try:
+        from zeroconf import ServiceBrowser, Zeroconf
+    except ImportError:
+        return {}
+    found: "dict[str, int]" = {}
+    lock = threading.Lock()
+
+    class _Listener:
+        def add_service(self, zc, type_, name):  # noqa: ANN001
+            try:
+                info = zc.get_service_info(type_, name)
+                if info is None or not info.addresses or not info.port:
+                    return
+                ip = socket.inet_ntoa(info.addresses[0])
+            except Exception:  # noqa: BLE001 — битая запись не роняет поиск
+                return
+            with lock:
+                found[ip] = int(info.port)
+
+        def update_service(self, zc, type_, name):  # noqa: ANN001
+            pass
+
+        def remove_service(self, zc, type_, name):  # noqa: ANN001
+            pass
+
+    zc = Zeroconf()
+    try:
+        ServiceBrowser(zc, PAIRING_MDNS_TYPE, _Listener())
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if stop is not None and stop.is_set():
+                break
+            with lock:
+                if found:
+                    break                    # первый найденный — достаточно
+            time.sleep(0.15)
+    except Exception:  # noqa: BLE001 — экзотическая сеть не должна ронять UI
+        pass
+    finally:
+        try:
+            zc.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return found
