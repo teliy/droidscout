@@ -35,6 +35,7 @@ from . import journal
 A_VERSION = 0x01000001          # версия протокола (device возьмёт минимум)
 MAX_PAYLOAD = 256 * 1024        # предлагаемый размер чанка
 _CNXN_GRACE = 1.0               # окно ожидания AUTH после первого CNXN (сек)
+_TLS_CNXN_WAIT = 8.0            # окно ожидания CNXN внутри TLS (сек)
 _MAX_RECV = 16 * 1024 * 1024    # санитарный предел длины пакета от устройства
 
 # Команда в заголовке пакета — little-endian uint32, поэтому первые 4 байта
@@ -371,17 +372,52 @@ class AdbDevice:
         второй CNXN. Если после первого CNXN тишина (grace-окно) —
         устройство без авторизации (ro.adb.secure=0).
 
-        «Отладка по Wi-Fi» (Android 11+, tls=True): канал начинается в
-        открытом виде — телефон ждёт наш CNXN и отвечает STLS (предложение
-        перевести транспорт на TLS 1.3). После нашего ответного STLS обе
-        стороны делают TLS-рукопожатие (телефон проверяет наш клиентский
-        сертификат по ключам, сохранённым при сопряжении), и обмен CNXN
-        начинается заново уже внутри TLS. Ровно так делает официальный
-        adb (protocol.TXT, A_STLS). В 1.7.0–1.7.2 мы отправляли ClientHello
-        сразу после connect — adbd не понимал эти байты и рвал соединение:
-        сопряжение проходило, а «Подключить» падало с любым портом.
+        «Отладка по Wi-Fi» (Android 11+, tls=True) — сверено с исходниками
+        AOSP packages/modules/adb (adb.cpp: handle_new_connection →
+        send_tls_request; adb_wifi.cpp: adbd_wifi_secure_connect):
+        1) канал начинается открыто: мы шлём CNXN — телефон отвечает
+           A_STLS (своего открытого CNXN он НЕ шлёт);
+        2) мы отвечаем A_STLS, обе стороны делают TLS 1.3 с клиентским
+           сертификатом (телефон проверяет наш ключ по сохранённому
+           при сопряжении);
+        3) CNXN внутри TLS первым шлёт САМ телефон
+           (adbd_wifi_secure_connect → send_connect). Наш повторный CNXN
+           там запрещён: в adbd любой CNXN проходит через
+           handle_new_connection, который делает handle_offline и снова
+           send_tls_request — транспорт разрушается сразу после
+           «успешного» рукопожатия. Это был баг 1.7.3: сопряжение
+           проходило, а «Подключить» падало с любым портом.
+
+        Если телефон молчит или рвёт соединение после нашего открытого
+        CNXN, пробуем второй сценарий на свежем TCP: часть прошивок
+        начинает TLS сразу после connect (ClientHello первым).
         """
         deadline = auth_timeout or max(self.timeout, 30.0)
+        if not self.tls:
+            self._open_tcp()
+            self._send(A_CNXN, A_VERSION, MAX_PAYLOAD, b"host::\x00")
+            self._finish_handshake(deadline, saw_cnxn=False, secure=False)
+            return
+
+        first_exc = None
+        for tls_first in (False, True):
+            try:
+                self._open_tcp()
+            except AdbError:
+                if first_exc is not None:
+                    raise first_exc from None   # порт недоступен — ретраи не помогут
+                raise
+            try:
+                self._connect_secure(tls_first, deadline)
+                return
+            except AdbUnauthorized:
+                raise          # телефон явно отклонил ключ — ретрай бессмыслен
+            except AdbError as exc:
+                first_exc = first_exc or exc
+                self.close()
+        raise first_exc
+
+    def _open_tcp(self):
         try:
             self.sock = socket.create_connection((self.host, self.port),
                                                  timeout=self.timeout)
@@ -394,25 +430,29 @@ class AdbDevice:
         except OSError:
             pass  # экзотическая платформа — работает и без этого
 
+    def _connect_secure(self, tls_first: bool, deadline: float):
+        """Рукопожатие «Отладки по Wi-Fi».
+
+        tls_first=False — канонический AOSP-сценарий: CNXN → STLS → TLS;
+        tls_first=True — прошивки, начинающие TLS сразу после connect.
+        """
+        from . import wifi_pair
+        key = self.keypair or load_or_create_keys()
         saw_cnxn = False
-        secure_transport = False
-        if self.tls:
+        if tls_first:
+            self.sock = self._wrap_tls(key)
+            # внутри TLS первым CNXN присылает телефон
+        else:
             self._send(A_CNXN, A_VERSION, MAX_PAYLOAD, _CONNECT_FEATURES)
             try:
-                first = self._recv(self.timeout)
+                first = self._recv(min(self.timeout, 6.0))
             except (socket.timeout, TimeoutError) as exc:
                 raise AdbTimeout("no CNXN/STLS answer from device") from exc
+            except OSError as exc:
+                raise AdbError(f"device closed connection: {exc}") from exc
             if first.cmd == A_STLS:
                 self._send(A_STLS, first.arg0 or TLS_VERSION_MIN, 0, b"")
-                # Обычный ADB-протокол течёт внутри TLS 1.3 с клиентским
-                # сертификатом. Обёртка даёт сокет с тем же интерфейсом
-                # (recv/sendall/settimeout/close).
-                from . import wifi_pair
-                key = self.keypair or load_or_create_keys()
-                self.sock = wifi_pair.wrap_tls(self.sock, self.timeout, key)
-                secure_transport = True
-                # внутри TLS транспорт начинается заново — представляемся
-                self._send(A_CNXN, A_VERSION, MAX_PAYLOAD, _CONNECT_FEATURES)
+                self.sock = self._wrap_tls(key)
             elif first.cmd == A_CNXN:
                 # На этом порту обычный adbd без «Отладки по Wi-Fi»
                 # (например, в шаг 2 ввели порт 5555 приставки) — работаем
@@ -423,9 +463,22 @@ class AdbDevice:
                 self.close()
                 raise AdbError(
                     f"unexpected packet 0x{first.cmd:08x} instead of STLS")
-        else:
-            self._send(A_CNXN, A_VERSION, MAX_PAYLOAD, b"host::\x00")
+        self._finish_handshake(deadline, saw_cnxn=saw_cnxn,
+                               secure=not saw_cnxn)
 
+    def _wrap_tls(self, key: dict):
+        """TLS 1.3 с клиентским сертификатом поверх текущего TCP-сокета."""
+        from . import wifi_pair
+        try:
+            return wifi_pair.wrap_tls(self.sock, self.timeout, key)
+        except wifi_pair.PairError as exc:
+            # PairError → AdbError с машинным префиксом «tls:» для
+            # классификации в UI (неверный порт/ключ прошивки и т.п.)
+            raise AdbError(f"tls: {exc.detail or exc.code}") from exc
+
+    def _finish_handshake(self, deadline: float, saw_cnxn: bool,
+                          secure: bool):
+        """Цикл CNXN/AUTH после установления транспорта."""
         deadline_ts = _now() + deadline
         pubkey_sent = False
         tokens_seen = 0
@@ -438,6 +491,10 @@ class AdbDevice:
                     raise AdbTimeout("handshake timeout")
                 # После первого CNXN ждём возможный AUTH короткое окно
                 wait = remaining if not saw_cnxn else min(remaining, _CNXN_GRACE)
+                if secure:
+                    # Внутри TLS первым CNXN шлёт телефон сразу после
+                    # рукопожатия — ждать дольше 8 с бессмысленно
+                    wait = min(wait, _TLS_CNXN_WAIT)
                 try:
                     message = self._recv(wait)
                 except (socket.timeout, TimeoutError) as exc:
@@ -445,6 +502,9 @@ class AdbDevice:
                         raise AdbUnauthorized("user did not confirm the key") from exc
                     if saw_cnxn:
                         return  # insecure-устройство: после CNXN тишина
+                    if secure:
+                        raise AdbTimeout(
+                            "no CNXN inside TLS — key not accepted?") from exc
                     raise AdbTimeout("handshake timeout") from exc
                 except AdbError as exc:
                     # Устройство разорвало соединение: если оно уже увидело
@@ -454,13 +514,22 @@ class AdbDevice:
                     raise
                 if message.cmd == A_CNXN:
                     self.max_payload = max(1024, min(message.arg1, MAX_PAYLOAD))
-                    if secure_transport:
+                    if secure:
                         return        # TLS уже авторизовал нас — AUTH не будет
                     if tokens_seen:
                         return        # подтверждение после авторизации
                     if saw_cnxn:
                         return        # повторный CNXN без AUTH — insecure
                     saw_cnxn = True
+                    continue
+                if message.cmd == A_STLS and not secure:
+                    # Запрос TLS-перехода после открытого обмена (часть
+                    # прошивок шлёт STLS после своего CNXN): отвечаем и
+                    # продолжаем внутри TLS — CNXN пришлёт телефон.
+                    self._send(A_STLS, message.arg0 or TLS_VERSION_MIN, 0, b"")
+                    self.sock = self._wrap_tls(
+                        self.keypair or load_or_create_keys())
+                    secure = True
                     continue
                 if message.cmd == A_AUTH and message.arg0 == AUTH_TOKEN:
                     tokens_seen += 1

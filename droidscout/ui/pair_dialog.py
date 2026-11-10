@@ -8,8 +8,11 @@
 Шаг 2: порт подключения с главного экрана «Отладка по Wi-Fi» (строка
 «IP-адрес и порт»); IP переносится из шага 1. Код на этом шаге не
 нужен: после сопряжения телефон авторизует компьютер по сохранённому
-ключу. Для повторного подключения (порт сменился после перезагрузки)
-есть кнопка «Уже сопряжено →» — она пропускает шаг 1.
+ключу. После успешного сопряжения мастер сам ищет актуальный порт по
+mDNS (_adb-tls-connect) и сразу подключается — вручную остаётся только
+ввести порт, если телефон по сети не нашёлся. Для повторного
+подключения (порт сменился после перезагрузки) есть кнопка
+«Уже сопряжено →» — она пропускает шаг 1.
 
 Вся сеть — в фоновом потоке, интерфейс не блокируется.
 """
@@ -26,6 +29,34 @@ _STATUS_OK = "color:#7bd88f;"
 _STATUS_ERR = "color:#f45b69;"
 
 
+def _classify_conn_error(detail: str) -> str:
+    """Машинный код причины неудачного ПОДКЛЮЧЕНИЯ (шаг 2).
+
+    Раньше любая ошибка подключения маскировалась как «ADB не отвечает»
+    и не давала понять, что именно не так. Разбираем текст исключения
+    (это единственный сквозной канал: adb_actions оборачивает всё в
+    ActionError): отказ TCP/тайм-аут — не тот порт; TLS — телефон
+    отклонил защищённое соединение; CNXN внутри TLS не пришёл — ключ
+    не принят; нестандартный пакет — на порту не ADB.
+    """
+    low = (detail or "").lower()
+    if low.startswith("connect:") or any(
+            w in low for w in ("refused", "unreachable", "no route",
+                               "network is", "timed out", "getaddrinfo")):
+        return "noport"
+    if low.startswith("tls:") or any(
+            w in low for w in ("wrong version", "handshake", "alert",
+                               "certificate", "closed connection")):
+        return "tls"
+    if "no cnxn/stls" in low:
+        return "noport"            # TCP есть, ADB не ответил — не тот порт
+    if "no cnxn inside tls" in low:
+        return "noauth"
+    if "unexpected packet" in low:
+        return "packet"
+    return "adbconn"
+
+
 def _error_hint(detail: str, code: str) -> str:
     """Человеческая подсказка по характеру ошибки подключения.
 
@@ -34,6 +65,8 @@ def _error_hint(detail: str, code: str) -> str:
     ключ (сопряжение делали давно/другим приложением — повторить шаг 1).
     """
     low = (detail or "").lower()
+    if code in ("noport", "tls", "noauth", "packet"):
+        return ""            # у этих кодов текст самодостаточен
     if (code in ("connect", "timeout", "adbconn")
             or any(w in low for w in ("refused", "timed out", "timeout",
                                       "unreachable", "no route", "network is",
@@ -86,7 +119,12 @@ class _PairWorker(QObject):
             self.done.emit({"stage": self.mode, "ok": False,
                             "code": exc.code, "detail": exc.detail})
         except adb_actions.ActionError as exc:
-            code = {"unauthorized": "unauth"}.get(exc.code, "adbconn")
+            if exc.code == "unauthorized":
+                code = "unauth"
+            elif self.mode == "connect":
+                code = _classify_conn_error(str(exc))
+            else:
+                code = "adbconn"
             self.done.emit({"stage": self.mode, "ok": False,
                             "code": code, "detail": str(exc)})
         except Exception as exc:  # noqa: BLE001 — последняя линия обороны
@@ -236,9 +274,9 @@ class PairDialog(QDialog):
         self._begin(i18n.tr("wifi_finding"))
         self._spawn(_PairWorker("discover"))
 
-    def _start_find_port(self):
+    def _start_find_port(self, status: str = "", ok: bool = False):
         ip = self.ip2_edit.text().strip() or self.ip_edit.text().strip()
-        self._begin(i18n.tr("wifi_finding_port"))
+        self._begin(status or i18n.tr("wifi_finding_port"), ok=ok)
         self._spawn(_PairWorker("discover_conn", ip=ip))
 
     def _start_pair(self):
@@ -264,11 +302,11 @@ class PairDialog(QDialog):
         self._spawn(_PairWorker("connect", ip=ip, conn_port=conn_port))
 
     # ------------------------------------------------------------ служебное
-    def _begin(self, text: str):
+    def _begin(self, text: str, ok: bool = False):
         for btn in (self.find_btn, self.pair_btn, self.skip_btn,
                     self.back_btn, self.find_port_btn, self.conn_btn):
             btn.setEnabled(False)
-        self._set_status(text)
+        self._set_status(text, ok=ok)
 
     @staticmethod
     def _port(edit) -> "int | None":
@@ -329,9 +367,12 @@ class PairDialog(QDialog):
                 self.conn_port_edit.setText(str(port))
                 self._set_status(i18n.tr("wifi_find_port_ok", ip=ip,
                                          port=port), ok=True)
-                self.conn_btn.setFocus()
-            else:
-                self._set_status(i18n.tr("wifi_find_port_fail"))
+                # Порт актуален — подключаемся сразу (и после ручного
+                # «Найти порт», и в автоцепочке после сопряжения)
+                self._start_connect()
+                return
+            self._set_status(i18n.tr("wifi_find_port_fail"))
+            self.conn_port_edit.setFocus()
             return
 
         if not result["ok"]:
@@ -348,8 +389,11 @@ class PairDialog(QDialog):
         if stage == "pair":
             config.set_key("wifi_last_ip", self.ip_edit.text().strip())
             self._go_step2()
-            self._set_status(i18n.tr("wifi_pair_ok", guid=result["guid"]),
-                             ok=True)
+            # Порт подключения ищем сами и сразу подключаем: после
+            # сопряжения пользователю больше ничего нажимать не нужно
+            self._start_find_port(
+                status=i18n.tr("wifi_pair_ok_finding", guid=result["guid"]),
+                ok=True)
             return
 
         # Подключение удалось — добавляем устройство в таблицу
